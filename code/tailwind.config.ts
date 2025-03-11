@@ -1,7 +1,6 @@
+/* eslint-disable prefer-const */
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /** @type {import('tailwindcss').Config} */
-import defaultTheme from "tailwindcss/defaultTheme";
-
-import colors from "tailwindcss/colors";
 
 import { default as flattenColorPalette } from "tailwindcss/lib/util/flattenColorPalette";
 
