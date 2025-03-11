@@ -16,6 +16,24 @@ https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
 - **Markdown Export**: Generated question papers are formatted in clean, structured Markdown for easy export to other formats
 - **Cloud File Storage**: Uses Convex for secure file uploads, storage, and management
 
+## 🧠 How It Works
+
+![image](https://github.com/user-attachments/assets/64bfb2cc-1ab4-4c63-b7cb-71d1f00942a9)
+
+QuestGen-AI employs a sophisticated multi-agent system powered by LangChain and large language models:
+
+1. **Extractor Agent**: Analyzes your input requirements to understand the exam type, total marks, question types, and subject areas
+
+2. **Question Creator Agent**: Generates appropriate questions based on the extracted requirements and the content of the uploaded PDFs
+
+3. **Question Analysis Agent**: Evaluates the generated questions for quality, clarity, relevance, and alignment with requirements
+
+4. **Decider Agent**: Determines if the questions meet all requirements or need further refinement
+
+5. **Formatter Agent**: Arranges the questions into a professionally formatted exam paper with clear sections and instructions
+
+This multi-step process ensures high-quality, relevant questions that align with your specific needs and content.
+
 ## 🛠️ Technology Stack
 
 - **Frontend**: Next.js, React, TailwindCSS, Framer Motion
@@ -39,7 +57,7 @@ https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/yourusername/QuestGen-AI.git
+   https://github.com/cRED-f/QuestGen-AI-Agent.git
    cd QuestGen-AI
    ```
 
@@ -128,23 +146,7 @@ https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
    - Copy the content
    - Print or save the question paper
 
-## 🧠 How It Works
 
-![image](https://github.com/user-attachments/assets/64bfb2cc-1ab4-4c63-b7cb-71d1f00942a9)
-
-QuestGen-AI employs a sophisticated multi-agent system powered by LangChain and large language models:
-
-1. **Extractor Agent**: Analyzes your input requirements to understand the exam type, total marks, question types, and subject areas
-
-2. **Question Creator Agent**: Generates appropriate questions based on the extracted requirements and the content of the uploaded PDFs
-
-3. **Question Analysis Agent**: Evaluates the generated questions for quality, clarity, relevance, and alignment with requirements
-
-4. **Decider Agent**: Determines if the questions meet all requirements or need further refinement
-
-5. **Formatter Agent**: Arranges the questions into a professionally formatted exam paper with clear sections and instructions
-
-This multi-step process ensures high-quality, relevant questions that align with your specific needs and content.
 
 ## 📁 Project Structure
 
