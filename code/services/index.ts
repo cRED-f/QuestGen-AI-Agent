@@ -7,9 +7,7 @@ import {
   SystemMessagePromptTemplate,
 } from "@langchain/core/prompts";
 import { ChatOpenAI } from "@langchain/openai";
-import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
 import { WebPDFLoader } from "@langchain/community/document_loaders/web/pdf";
-import path from "path";
 import { Runnable, RunnableConfig } from "@langchain/core/runnables";
 
 // Add OpenRouter integration
@@ -542,7 +540,6 @@ export async function generateQuestions({
   questionHeader,
   questionDescription,
   apiKey,
-  uploadedFiles = [],
   fileUrls = [],
   siteUrl,
   siteName,
@@ -616,51 +613,6 @@ export async function generateQuestions({
     }
   };
 
-  const processPDFs = async (uploadedFiles: string[]) => {
-    try {
-      const allDocs = [];
-
-      for (const file of uploadedFiles) {
-        try {
-          console.log(`Processing file: ${file}`);
-
-          // Use absolute path to temp directory instead of relative path
-          const tempDir = path.join(process.cwd(), "temp");
-          const filePath = path.join(tempDir, file);
-
-          try {
-            const loader = new PDFLoader(filePath);
-            const docs = await loader.load();
-            allDocs.push(...docs);
-            console.log(`Successfully processed PDF: ${file}`);
-          } catch (loadError) {
-            console.error(`Error processing PDF ${file}:`, loadError);
-          }
-        } catch (fileError) {
-          console.error(`Error processing file ${file}:`, fileError);
-        }
-      }
-
-      // Split documents into chunks
-      const textSplitter = new RecursiveCharacterTextSplitter({
-        chunkSize: 4000,
-        chunkOverlap: 200,
-      });
-
-      console.log(`Splitting ${allDocs.length} documents`);
-      const splitDocs = await textSplitter.splitDocuments(allDocs);
-      console.log(`Split into ${splitDocs.length} chunks`);
-      return splitDocs;
-    } catch (error) {
-      console.error("Error processing files:", error);
-      throw new Error(
-        `Failed to process files: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
-    }
-  };
-
   try {
     // Process files from either local paths or URLs based on what's available
     console.log("📚 Processing PDF files");
@@ -672,11 +624,6 @@ export async function generateQuestions({
     if (fileUrls && fileUrls.length > 0) {
       console.log(`Processing ${fileUrls.length} PDF URLs`);
       fileDocs = await processPDFUrls(fileUrls);
-    }
-    // Otherwise fall back to local files if available
-    else if (uploadedFiles && uploadedFiles.length > 0) {
-      console.log(`Processing ${uploadedFiles.length} local PDF files`);
-      fileDocs = await processPDFs(uploadedFiles);
     }
 
     const fileText = fileDocs.map((doc) => doc.pageContent).join("\n\n");

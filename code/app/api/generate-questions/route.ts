@@ -275,6 +275,39 @@ export async function GET(req: NextRequest) {
       const writer = writable.getWriter();
       const encoder = new TextEncoder();
 
+      // Track writer state
+      let writerClosed = false;
+
+      // // Helper function to safely close the writer
+      // const safelyCloseWriter = async () => {
+      //   try {
+      //     // Only attempt to close if we haven't already closed it
+      //     if (!writerClosed) {
+      //       writerClosed = true;
+      //       await writer.close();
+      //     }
+      //   } catch (closeError) {
+      //     console.error("Error closing writer:", closeError);
+      //     // We've tried our best to close it, continue with the flow
+      //     writerClosed = true; // Consider it closed even if there was an error
+      //   }
+      // };
+
+      // Helper function to safely write to the stream
+      const safelyWriteToStream = async (data: string) => {
+        if (!writerClosed) {
+          try {
+            await writer.write(encoder.encode(data));
+            return true;
+          } catch (writeError) {
+            console.error("Error writing to stream:", writeError);
+            writerClosed = true; // Consider it closed if we can't write
+            return false;
+          }
+        }
+        return false;
+      };
+
       // Process the stream in the background
       (async () => {
         try {
@@ -346,13 +379,17 @@ export async function GET(req: NextRequest) {
               })}\n\n`;
 
               // Write the chunk to the stream
-              await writer.write(encoder.encode(formattedChunk));
+              const writeSuccess = await safelyWriteToStream(formattedChunk);
+              if (!writeSuccess) break;
 
               // Close the stream after sending error
-              await writer.write(
-                encoder.encode("event: complete\ndata: done\n\n")
-              );
-              await writer.close();
+              await safelyWriteToStream("event: complete\ndata: done\n\n");
+
+              // Clean up Convex files before closing writer
+              await cleanupConvexFiles();
+
+              // // Safely close the writer
+              // await safelyCloseWriter();
 
               // Exit the processing loop
               return;
@@ -370,35 +407,38 @@ export async function GET(req: NextRequest) {
               );
 
               // Write the chunk to the stream
-              await writer.write(encoder.encode(formattedChunk));
+              const writeSuccess = await safelyWriteToStream(formattedChunk);
+              if (!writeSuccess) break;
             }
           }
 
           // Signal completion
-          await writer.write(encoder.encode("event: complete\ndata: done\n\n"));
+          await safelyWriteToStream("event: complete\ndata: done\n\n");
 
           // Clean up Convex files after successful streaming
           await cleanupConvexFiles();
 
-          await writer.close();
+          // Safely close the writer
+          // await safelyCloseWriter();
         } catch (error: unknown) {
           console.error("Stream error:", error);
           const errorMessage =
             error instanceof Error
               ? error.message
               : "An unknown error occurred";
-          await writer.write(
-            encoder.encode(
-              `event: error\ndata: ${JSON.stringify({
-                error: errorMessage,
-              })}\n\n`
-            )
+
+          // Try to write the error message if writer is still available
+          await safelyWriteToStream(
+            `event: error\ndata: ${JSON.stringify({
+              error: errorMessage,
+            })}\n\n`
           );
 
           // Clean up Convex files even if we had streaming errors
           await cleanupConvexFiles();
 
-          await writer.close();
+          // // Safely close the writer
+          // await safelyCloseWriter();
         }
       })();
 
