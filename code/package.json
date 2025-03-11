@@ -17,6 +17,7 @@
     "@radix-ui/react-label": "^2.1.2",
     "@tabler/icons-react": "^3.31.0",
     "clsx": "^2.1.1",
+    "convex": "^1.20.0",
     "env": "^0.0.2",
     "framer-motion": "^12.4.10",
     "fs": "^0.0.1-security",

@@ -8,6 +8,7 @@ import {
 } from "@langchain/core/prompts";
 import { ChatOpenAI } from "@langchain/openai";
 import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+import { WebPDFLoader } from "@langchain/community/document_loaders/web/pdf";
 import path from "path";
 import { Runnable, RunnableConfig } from "@langchain/core/runnables";
 
@@ -19,7 +20,8 @@ interface GenerateQuestionsParams {
   questionHeader: string;
   questionDescription: string;
   apiKey: string;
-  uploadedFiles: string[];
+  uploadedFiles?: string[]; // Make optional
+  fileUrls?: string[]; // Add fileUrls parameter
   siteUrl?: string; // For OpenRouter HTTP-Referer
   siteName?: string; // For OpenRouter X-Title
   modelName: string; // Changed from optional to required
@@ -456,6 +458,7 @@ Create a well-structured, professional exam paper that incorporates all the feed
   function mainRouter(state: typeof AgentState.State) {
     const messages = state.messages;
     const lastMessage = messages[messages.length - 1] as AIMessage;
+    const iterationCount = state.iterationCount || 0;
 
     if (lastMessage.name === "Extractor") {
       console.log("🔄 Router: Extractor → Question Creator");
@@ -468,13 +471,19 @@ Create a well-structured, professional exam paper that incorporates all the feed
       return "to_decider";
     } else if (lastMessage.name === "Decider") {
       const content = lastMessage.content as string;
-      // Simple binary decision
-      if (content.includes("NOT PERFECT")) {
-        // Not perfect, go back to question creator
-        console.log("🔄 Router: Decider → Question Creator (NOT PERFECT)");
+
+      // Check if we've already done one iteration through the feedback loop
+      if (content.includes("NOT PERFECT") && iterationCount < 1) {
+        // First time getting NOT PERFECT, go back to question creator
+        console.log(
+          "🔄 Router: Decider → Question Creator (NOT PERFECT, iteration 1)"
+        );
         return "to_question_creator";
       } else {
-        console.log("🔄 Router: Decider → Formatter (PERFECT)");
+        // Either PERFECT or we've already gone through the feedback loop once
+        console.log(
+          `🔄 Router: Decider → Formatter (${content.includes("PERFECT") ? "PERFECT" : "MAX ITERATIONS REACHED"})`
+        );
         return "to_formatter";
       }
     } else if (lastMessage.name === "Formatter") {
@@ -533,12 +542,79 @@ export async function generateQuestions({
   questionHeader,
   questionDescription,
   apiKey,
-  uploadedFiles,
+  uploadedFiles = [],
+  fileUrls = [],
   siteUrl,
   siteName,
   modelName,
 }: GenerateQuestionsParams) {
   console.log("🚀 Starting question generation process with streaming enabled");
+
+  // New function to process PDF URLs
+  const processPDFUrls = async (urls: string[]) => {
+    try {
+      const allDocs = [];
+
+      for (const url of urls) {
+        try {
+          console.log(`Processing PDF URL: ${url}`);
+
+          try {
+            // Fetch the PDF directly using fetch API first
+            console.log(`Fetching PDF from URL: ${url}`);
+            const response = await fetch(url);
+
+            if (!response.ok) {
+              throw new Error(
+                `Failed to fetch PDF: ${response.status} ${response.statusText}`
+              );
+            }
+
+            // Get the array buffer from the response
+            const arrayBuffer = await response.arrayBuffer();
+            console.log(`Received PDF data: ${arrayBuffer.byteLength} bytes`);
+
+            // Convert to Uint8Array which WebPDFLoader can handle from memory
+            const uint8Array = new Uint8Array(arrayBuffer);
+
+            // Use WebPDFLoader with the blob data directly
+            const loader = new WebPDFLoader(
+              new Blob([uint8Array], { type: "application/pdf" })
+            );
+
+            console.log("Loading PDF content with WebPDFLoader...");
+            const docs = await loader.load();
+            console.log(`Loaded ${docs.length} documents from PDF`);
+
+            allDocs.push(...docs);
+            console.log(`Successfully processed PDF from URL: ${url}`);
+          } catch (loadError) {
+            console.error(`Error processing PDF from URL ${url}:`, loadError);
+          }
+        } catch (urlError) {
+          console.error(`Error processing URL ${url}:`, urlError);
+        }
+      }
+
+      // Split documents into chunks
+      const textSplitter = new RecursiveCharacterTextSplitter({
+        chunkSize: 4000,
+        chunkOverlap: 200,
+      });
+
+      console.log(`Splitting ${allDocs.length} documents from URLs`);
+      const splitDocs = await textSplitter.splitDocuments(allDocs);
+      console.log(`Split into ${splitDocs.length} chunks`);
+      return splitDocs;
+    } catch (error) {
+      console.error("Error processing PDF URLs:", error);
+      throw new Error(
+        `Failed to process PDF URLs: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  };
 
   const processPDFs = async (uploadedFiles: string[]) => {
     try {
@@ -586,9 +662,23 @@ export async function generateQuestions({
   };
 
   try {
-    // Process the uploaded PDFs
+    // Process files from either local paths or URLs based on what's available
     console.log("📚 Processing PDF files");
-    const fileDocs = await processPDFs(uploadedFiles);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let fileDocs: any[] = [];
+
+    // If we have URLs, process those
+    if (fileUrls && fileUrls.length > 0) {
+      console.log(`Processing ${fileUrls.length} PDF URLs`);
+      fileDocs = await processPDFUrls(fileUrls);
+    }
+    // Otherwise fall back to local files if available
+    else if (uploadedFiles && uploadedFiles.length > 0) {
+      console.log(`Processing ${uploadedFiles.length} local PDF files`);
+      fileDocs = await processPDFs(uploadedFiles);
+    }
+
     const fileText = fileDocs.map((doc) => doc.pageContent).join("\n\n");
     console.log(`📄 Extracted ${fileText.length} characters of text from PDFs`);
 

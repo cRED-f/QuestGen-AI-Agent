@@ -2,11 +2,7 @@
 
 QuestGen-AI is an advanced exam question generation platform that leverages AI-Agent to automatically create customized question papers from user-uploaded PDF content. Built for educators and assessment creators, QuestGen-AI streamlines the often time-consuming process of creating high-quality assessment materials.
 
-
-
 https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
-
-
 
 ## 🚀 Features
 
@@ -18,6 +14,7 @@ https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
 - **Real-time Generation**: Watch as your question paper is created through a streaming interface
 - **Multi-Agent Architecture**: Utilizes specialized AI agents for extraction, creation, analysis, and formatting of questions
 - **Markdown Export**: Generated question papers are formatted in clean, structured Markdown for easy export to other formats
+- **Cloud File Storage**: Uses Convex for secure file uploads, storage, and management
 
 ## 🛠️ Technology Stack
 
@@ -27,12 +24,14 @@ https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
 - **PDF Processing**: PDF.js, pdf-parse
 - **Styling**: Custom UI components with Tailwind CSS and Framer Motion animations
 - **Streaming**: Server-Sent Events (SSE) for real-time content streaming
+- **Database & Storage**: Convex for file uploads, storage, and management
 
 ## 📋 Requirements
 
 - Node.js (v18.0 or later)
 - npm or yarn package manager
 - OpenRouter API key (for accessing AI models)
+- Convex account (for file storage)
 - Modern web browser
 
 ## 🔧 Installation & Setup
@@ -59,9 +58,18 @@ https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
    ```
    NEXT_PUBLIC_OPENROUTER_SITE_URL="http://localhost:3000"
    OPENROUTER_API_BASE="https://openrouter.ai/api/v1"
+   NEXT_PUBLIC_CONVEX_URL="your_convex_deployment_url"
    ```
 
-4. **Run the development server**
+4. **Initialize Convex**
+
+   ```bash
+   npx convex init
+   ```
+
+   Follow the prompts to connect to your Convex account and create a new deployment.
+
+5. **Run the development server**
 
    ```bash
    npm run dev
@@ -69,7 +77,7 @@ https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
    yarn dev
    ```
 
-5. **Access the application**
+6. **Access the application**
 
    Open [http://localhost:3000](http://localhost:3000) in your web browser
 
@@ -124,7 +132,6 @@ https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
 
 ![image](https://github.com/user-attachments/assets/64bfb2cc-1ab4-4c63-b7cb-71d1f00942a9)
 
-
 QuestGen-AI employs a sophisticated multi-agent system powered by LangChain and large language models:
 
 1. **Extractor Agent**: Analyzes your input requirements to understand the exam type, total marks, question types, and subject areas
@@ -156,6 +163,10 @@ This multi-step process ensures high-quality, relevant questions that align with
 │   ├── eldoraui/             # Custom UI components
 │   ├── ui/                   # Base UI components
 │   └── About.tsx             # About component
+├── convex/                   # Convex database schema and functions
+│   ├── _generated/           # Auto-generated Convex type definitions
+│   ├── files.ts              # File storage operations
+│   └── schema.ts             # Database schema
 ├── lib/                      # Utility functions
 │   ├── prompts/              # AI prompt templates
 │   └── utils.ts              # Helper functions
@@ -223,7 +234,7 @@ Generates questions based on previously uploaded files.
 ## 🔒 Security Considerations
 
 - QuestGen-AI does not store your API keys permanently
-- Uploaded PDF files are processed temporarily and deleted once question generation is complete
+- Uploaded PDF files are securely stored in Convex and automatically deleted once question generation is complete
 - No user data is retained between sessions
 - API keys are transmitted securely but should still be protected carefully
 
@@ -242,4 +253,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ---
 
-Built with ❤️ using Next.js, LangChain, and OpenRouter
+Built with ❤️ using Next.js, LangChain, Convex, and OpenRouter

@@ -1,49 +1,144 @@
 import { NextRequest, NextResponse } from "next/server";
 import { generateQuestions } from "@/services/index";
-import fs from "fs";
-import path from "path";
+
+import { ConvexHttpClient } from "convex/browser";
+import { api } from "@/convex/_generated/api";
+import { Id } from "@/convex/_generated/dataModel";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
-    const uploadedFiles: string[] = [];
+    const uploadedFileIds: string[] = [];
+
+    // Initialize Convex client
+    const convex = new ConvexHttpClient(
+      process.env.NEXT_PUBLIC_CONVEX_URL || ""
+    );
+
+    // Verify Convex connection
+    console.log("Convex URL:", process.env.NEXT_PUBLIC_CONVEX_URL);
+
+    if (!process.env.NEXT_PUBLIC_CONVEX_URL) {
+      throw new Error("Missing NEXT_PUBLIC_CONVEX_URL environment variable");
+    }
 
     // Extract files from form data
     for (const entry of formData.entries()) {
       const [key, value] = entry as [string, File];
 
       if (key.startsWith("file-") && value instanceof File) {
-        // Create buffer from file data
-        const buffer = Buffer.from(await value.arrayBuffer());
+        // Upload file to Convex
+        try {
+          console.log(
+            `Processing file: ${value.name} (${value.type}), size: ${value.size} bytes`
+          );
 
-        // Ensure temp directory exists
-        const tempDir = path.join(process.cwd(), "temp");
-        if (!fs.existsSync(tempDir)) {
-          fs.mkdirSync(tempDir, { recursive: true });
+          // Get file buffer
+          const buffer = Buffer.from(await value.arrayBuffer());
+          console.log(`Created buffer of size: ${buffer.length} bytes`);
+
+          // Sanitize filename to prevent issues with special characters
+          const sanitizedName = value.name.replace(/[^a-zA-Z0-9.-]/g, "_");
+          console.log(`Sanitized filename: ${sanitizedName}`);
+
+          try {
+            // Generate upload URL from Convex
+            console.log("Requesting upload URL from Convex...");
+            const uploadUrl = await convex.mutation(
+              api.files.generateUploadUrl,
+              {
+                filename: sanitizedName,
+                contentType: value.type || "application/pdf",
+              }
+            );
+            console.log(
+              "Upload URL received:",
+              uploadUrl ? "Success" : "Failed"
+            );
+
+            if (!uploadUrl) {
+              throw new Error("Failed to get upload URL from Convex");
+            }
+
+            // Upload file to the generated URL
+            console.log("Uploading file to Convex storage...");
+            const uploadResponse = await fetch(uploadUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": value.type || "application/pdf",
+              },
+              body: buffer,
+            });
+
+            if (!uploadResponse.ok) {
+              const responseText = await uploadResponse.text();
+              console.error("Upload response:", responseText);
+              throw new Error(
+                `Upload failed with status ${uploadResponse.status}: ${responseText}`
+              );
+            }
+
+            console.log("File uploaded successfully, getting storage ID...");
+            const storageId = await uploadResponse.text();
+
+            console.log("Raw storage ID from upload response:", storageId);
+
+            // Ensure we have a valid storage ID (not JSON)
+            let finalStorageId = storageId;
+            if (storageId.startsWith("{") && storageId.includes("storageId")) {
+              try {
+                const parsed = JSON.parse(storageId);
+                finalStorageId = parsed.storageId;
+                console.log("Parsed storage ID from JSON:", finalStorageId);
+              } catch (e) {
+                console.error("Failed to parse storage ID, using as-is:", e);
+                // Continue with the original value if parsing fails
+              }
+            }
+
+            // Get the Convex file ID
+            console.log(
+              "Saving storage ID to Convex database:",
+              finalStorageId
+            );
+            const fileId = await convex.mutation(api.files.saveStorageId, {
+              filename: sanitizedName,
+              contentType: value.type || "application/pdf",
+              storageId: finalStorageId,
+            });
+
+            console.log("File saved in Convex with ID:", fileId);
+            uploadedFileIds.push(fileId);
+          } catch (convexError) {
+            console.error("Convex API error:", convexError);
+            throw convexError;
+          }
+        } catch (uploadError) {
+          console.error(
+            `Error uploading file ${value.name} to Convex:`,
+            uploadError
+          );
+          throw new Error(
+            `Failed to upload file ${value.name} to Convex: ${
+              uploadError instanceof Error
+                ? uploadError.message
+                : String(uploadError)
+            }`
+          );
         }
-
-        // Generate unique filename
-        const timestamp = Date.now();
-        const ext = path.extname(value.name);
-        const filename = `${timestamp}${ext}`;
-        const filePath = path.join(tempDir, filename);
-
-        // Save file to temp directory
-        fs.writeFileSync(filePath, buffer);
-        uploadedFiles.push(filename);
       }
     }
 
     // Log uploaded files to verify
-    console.log("Files uploaded via POST:", uploadedFiles);
+    console.log("Files uploaded to Convex:", uploadedFileIds);
 
-    // Return the uploaded filenames in the response
+    // Return the uploaded file IDs in the response
     return NextResponse.json(
       {
         message: "success",
-        uploadedFiles: uploadedFiles,
+        uploadedFiles: uploadedFileIds,
       },
       { status: 200 }
     );
@@ -84,42 +179,64 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Process uploaded files
-    let uploadedFiles: string[] = [];
+    // Process Convex file IDs
+    let convexFileIds: string[] = [];
     if (uploadedFilesParam) {
-      uploadedFiles = uploadedFilesParam
+      convexFileIds = uploadedFilesParam
         .split(",")
         .filter((file) => file.trim() !== "");
     }
 
-    console.log("Processing GET request with files:", uploadedFiles);
+    console.log("Processing GET request with Convex file IDs:", convexFileIds);
+
+    // Initialize Convex client for later use in cleanup
+    const convex = new ConvexHttpClient(
+      process.env.NEXT_PUBLIC_CONVEX_URL || ""
+    );
+
+    // Initialize fileData array to store file information
+    const fileUrls: string[] = [];
 
     // Check if we have files to process
-    if (uploadedFiles.length === 0) {
+    if (convexFileIds.length === 0) {
       console.warn("No uploaded files found for processing");
     } else {
-      // Verify files exist on disk
-      const tempDir = path.join(process.cwd(), "temp");
-      const existingFiles = uploadedFiles.filter((file) =>
-        fs.existsSync(path.join(tempDir, file))
-      );
+      try {
+        // Retrieve download URLs for each file ID
+        for (const fileId of convexFileIds) {
+          // Get download URL directly from Convex
+          const downloadUrl = await convex.query(api.files.getDownloadUrl, {
+            id: fileId as Id<"files">,
+          });
 
-      console.log(
-        `Found ${existingFiles.length}/${uploadedFiles.length} files on disk`
-      );
+          if (!downloadUrl) {
+            console.warn(`Failed to get download URL for file ID ${fileId}`);
+            continue;
+          }
 
-      if (existingFiles.length === 0 && uploadedFiles.length > 0) {
+          // Add URL to our list
+          fileUrls.push(downloadUrl);
+        }
+
+        if (fileUrls.length === 0 && convexFileIds.length > 0) {
+          return NextResponse.json(
+            {
+              message: "Failed to retrieve any file URLs from Convex",
+            },
+            { status: 400 }
+          );
+        }
+
+        console.log(
+          `Successfully retrieved ${fileUrls.length} file URLs from Convex`
+        );
+      } catch (convexError) {
+        console.error("Error retrieving files from Convex:", convexError);
         return NextResponse.json(
-          {
-            message:
-              "Uploaded files not found on server. Please try uploading again.",
-          },
-          { status: 400 }
+          { message: "Failed to retrieve files from storage" },
+          { status: 500 }
         );
       }
-
-      // Use only existing files
-      uploadedFiles = existingFiles;
     }
 
     // Use the service to generate questions with streaming
@@ -127,23 +244,30 @@ export async function GET(req: NextRequest) {
       questionHeader,
       questionDescription,
       apiKey,
-      uploadedFiles,
+      fileUrls,
       modelName,
     });
 
-    // Delete PDF files after data extraction
-    const tempDir = path.join(process.cwd(), "temp");
-    for (const file of uploadedFiles) {
+    // Function to delete files from Convex
+    const cleanupConvexFiles = async () => {
       try {
-        const filePath = path.join(tempDir, file);
-        if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
-          console.log(`Deleted processed file: ${file}`);
+        console.log("Cleaning up Convex files...");
+        for (const fileId of convexFileIds) {
+          try {
+            console.log(`Attempting to delete Convex file with ID: ${fileId}`);
+            await convex.mutation(api.files.deleteFile, {
+              id: fileId as Id<"files">,
+            });
+            console.log(`Successfully deleted Convex file: ${fileId}`);
+          } catch (deleteError) {
+            console.error(`Error deleting Convex file ${fileId}:`, deleteError);
+          }
         }
-      } catch (deleteError) {
-        console.error(`Error deleting file ${file}:`, deleteError);
+        console.log("Convex file cleanup completed");
+      } catch (cleanupError) {
+        console.error("Error during Convex file cleanup:", cleanupError);
       }
-    }
+    };
 
     if (result.stream) {
       // Create a transform stream to handle the SSE data
@@ -252,6 +376,10 @@ export async function GET(req: NextRequest) {
 
           // Signal completion
           await writer.write(encoder.encode("event: complete\ndata: done\n\n"));
+
+          // Clean up Convex files after successful streaming
+          await cleanupConvexFiles();
+
           await writer.close();
         } catch (error: unknown) {
           console.error("Stream error:", error);
@@ -266,6 +394,10 @@ export async function GET(req: NextRequest) {
               })}\n\n`
             )
           );
+
+          // Clean up Convex files even if we had streaming errors
+          await cleanupConvexFiles();
+
           await writer.close();
         }
       })();
@@ -279,6 +411,9 @@ export async function GET(req: NextRequest) {
         },
       });
     } else {
+      // Clean up Convex files if we don't have a stream
+      await cleanupConvexFiles();
+
       return NextResponse.json(
         { message: "No stream returned from generation service" },
         { status: 500 }
