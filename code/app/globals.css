@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+.placeholder-vertical::placeholder {
+  white-space: pre-line; /* Ensures line breaks are respected */
+  line-height: 1.5; /* Adds space between the lines */
+  text-align: left; /* Ensures the text aligns to the left */
+  color: rgba(
+    255,
+    255,
+    255,
+    0.7
+  ); /* Optional: Adjust the color to make it subtle */
+}
+.overflow-scrollbar-hidden::-webkit-scrollbar {
+  display: none;
+}
