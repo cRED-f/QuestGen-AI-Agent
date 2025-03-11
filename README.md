@@ -2,7 +2,11 @@
 
 QuestGen-AI is an advanced exam question generation platform that leverages AI-Agent to automatically create customized question papers from user-uploaded PDF content. Built for educators and assessment creators, QuestGen-AI streamlines the often time-consuming process of creating high-quality assessment materials.
 
-https://github.com/user-attachments/assets/bc8cec24-a104-4f22-9e8d-92a6568f6ea2
+
+
+https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
+
+
 
 ## 🚀 Features
 
@@ -118,7 +122,8 @@ https://github.com/user-attachments/assets/bc8cec24-a104-4f22-9e8d-92a6568f6ea2
 
 ## 🧠 How It Works
 
-![image](https://github.com/user-attachments/assets/1cfdb5fc-a541-4875-8c56-5b03545bed93)
+![image](https://github.com/user-attachments/assets/64bfb2cc-1ab4-4c63-b7cb-71d1f00942a9)
+
 
 QuestGen-AI employs a sophisticated multi-agent system powered by LangChain and large language models:
 
