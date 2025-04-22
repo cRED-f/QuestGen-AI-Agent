@@ -18,7 +18,8 @@ https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
 
 ## 🧠 How It Works
 
-![total system](https://github.com/user-attachments/assets/3d188882-26a7-4abb-bf2f-5a788bd21d4e)
+![total system](https://github.com/user-attachments/assets/a972a4ec-632e-4c6c-a2e4-fdcfd624fd83)
+
 
 
 QuestGen-AI employs a sophisticated multi-agent system powered by LangChain and large language models:
