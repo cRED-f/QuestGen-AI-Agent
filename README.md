@@ -258,3 +258,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ---
 
 Built with ❤️ using Next.js, LangChain, Convex, and OpenRouter
+
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](./LICENSE) file for details.
