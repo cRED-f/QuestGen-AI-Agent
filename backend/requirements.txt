@@ -9,3 +9,4 @@ deepagents>=0.5.4,<1
 langchain-openai>=1.0,<2
 langgraph-checkpoint-sqlite>=3,<4
 reportlab>=4.2,<5
+cryptography>=43,<47

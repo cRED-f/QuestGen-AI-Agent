@@ -16,6 +16,7 @@ from backend import generation
 def client(monkeypatch, tmp_path):
     monkeypatch.setenv("QUESTGEN_DB_PATH", str(tmp_path / "test.sqlite3"))
     with TestClient(module.app) as c:
+        c.put("/api/settings", json={"provider": "ollama", "model": "qwen3:8b"})
         yield c
 
 

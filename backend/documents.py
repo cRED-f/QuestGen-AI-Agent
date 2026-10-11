@@ -195,11 +195,14 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     model = os.getenv("QUESTGEN_EMBED_MODEL", "").strip()
     if not model:
         return []
-    url = os.getenv("QUESTGEN_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/") + "/api/embed"
+    # Honor the same Ollama connection and optional proxy key used in Model settings.
+    from backend.app import model_credentials
+    chat_url, auth_headers = model_credentials({"provider": "ollama"})
+    url = chat_url.removesuffix("/v1/chat/completions") + "/api/embed"
     vectors: list[list[float]] = []
     with httpx.Client(timeout=httpx.Timeout(90, connect=5)) as client:
         for start in range(0, len(texts), 16):
-            result = client.post(url, json={"model": model, "input": texts[start:start + 16]})
+            result = client.post(url, headers=auth_headers, json={"model": model, "input": texts[start:start + 16]})
             result.raise_for_status()
             batch = result.json().get("embeddings", [])
             if len(batch) != len(texts[start:start + 16]):

@@ -18,6 +18,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("QUESTGEN_UPLOAD_DIR", str(tmp_path / "files"))
     monkeypatch.delenv("QUESTGEN_EMBED_MODEL", raising=False)
     with TestClient(service.app) as client:
+        client.put("/api/settings", json={"provider": "ollama", "model": "qwen3:8b"})
         yield client
 
 

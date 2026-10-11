@@ -20,7 +20,7 @@ from typing import AsyncIterator, Iterator, Literal
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse, Response
-from backend import documents, generation, customization
+from backend import documents, generation, customization, provider_config
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -30,6 +30,8 @@ PROVIDER_URLS = {
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
     "openai": "https://api.openai.com/v1/chat/completions",
     "ollama": "http://127.0.0.1:11434/v1/chat/completions",
+    "anthropic": "https://api.anthropic.com/v1/chat/completions",
+    "9router": "http://127.0.0.1:20128/v1/chat/completions",
 }
 SYSTEM_PROMPT = (
     "You are QuestGen, an assistant for professors preparing assessments. "
@@ -100,8 +102,9 @@ def init_db() -> None:
         )
         conn.execute(
             "INSERT OR IGNORE INTO workspace_settings(id,provider,model) "
-            "VALUES (1,'ollama','qwen3:8b')"
+            "VALUES (1,'ollama','')"
         )
+        provider_config.ensure_tables(conn)
         documents.ensure_tables(conn)
         generation.ensure_tables(conn)
         customization.ensure_tables(conn)
@@ -190,14 +193,15 @@ class MessageInput(BaseModel):
 
 
 class SettingsInput(BaseModel):
-    provider: Literal["ollama", "openrouter", "openai"]
-    model: str = Field(min_length=1, max_length=120)
+    provider: Literal["ollama", "openrouter", "openai", "anthropic", "9router"]
+    # Empty means: choose an available model in the chat UI.
+    model: str = Field(default="", max_length=180)
 
     @field_validator("model")
     @classmethod
     def valid_model(cls, value: str) -> str:
         value = value.strip()
-        if not value or any(ord(ch) < 32 for ch in value):
+        if any(ord(ch) < 32 for ch in value):
             raise ValueError("Invalid model name")
         return value
 
@@ -408,21 +412,88 @@ def update_settings(data: SettingsInput):
     return data.model_dump()
 
 
+@app.get("/api/provider-connections")
+def list_provider_connections():
+    with database() as conn:
+        return [provider_config.connection(conn, provider) for provider in provider_config.PROVIDERS]
+
+
+@app.put("/api/provider-connections/{provider}")
+def save_provider_connection(provider: str, data: provider_config.ConnectionInput):
+    with database() as conn:
+        return provider_config.save(conn, provider, data)
+
+
+@app.post("/api/provider-connections/{provider}/test")
+async def test_provider_connection(provider: str):
+    if provider not in provider_config.PROVIDERS:
+        raise HTTPException(status_code=422, detail="Unsupported provider")
+    result = await list_models(provider)
+    return {"provider": provider, "connected": True, "models_found": len(result["models"])}
+
+
 def model_credentials(settings: dict) -> tuple[str, dict[str, str]]:
+    """Resolve stored-or-environment secrets server-side; never include secrets in JSON."""
     provider = settings["provider"]
+    with database() as conn:
+        entry = provider_config.connection(conn, provider)
+        key = provider_config.secret(conn, provider)
+    if entry["requires_key"] and not key:
+        raise HTTPException(status_code=422, detail=f"Configure the {provider} API key in Model settings")
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
     if provider == "ollama":
-        # This endpoint can only be changed by trusted server administrators.
-        base = os.getenv("QUESTGEN_OLLAMA_URL", "http://127.0.0.1:11434")
-        url = base.rstrip("/") + "/v1/chat/completions"
-        return url, {}
-    key = os.getenv("OPENROUTER_API_KEY" if provider == "openrouter" else "OPENAI_API_KEY")
-    if not key:
-        raise HTTPException(status_code=422, detail=f"Server has no API key for {provider}")
-    headers = {"Authorization": f"Bearer {key}"}
+        return entry["base_url"].rstrip("/") + "/v1/chat/completions", headers
+    if provider == "9router":
+        return entry["base_url"].rstrip("/") + "/chat/completions", headers
     if provider == "openrouter":
-        headers["HTTP-Referer"] = "https://questgen.local"
-        headers["X-Title"] = "QuestGen"
+        headers.update({"HTTP-Referer": "https://questgen.local", "X-Title": "QuestGen"})
     return PROVIDER_URLS[provider], headers
+
+
+def require_model(settings: dict) -> None:
+    if not settings["model"].strip():
+        raise HTTPException(status_code=422, detail="Select an available model from the chat interface first")
+
+
+@app.get("/api/models")
+async def list_models(provider: Literal["ollama", "openrouter", "openai", "anthropic", "9router"]):
+    """Fresh provider catalog, normalized for searchable chat selection.
+
+    No hard-coded models or fake fallback when a provider is offline.
+    """
+    url, headers = model_credentials({"provider": provider})
+    if provider == "ollama":
+        endpoint = url.removesuffix("/v1/chat/completions") + "/api/tags"
+    elif provider == "anthropic":
+        endpoint = "https://api.anthropic.com/v1/models?limit=1000"
+        headers = {"x-api-key": headers["Authorization"].removeprefix("Bearer "),
+                   "anthropic-version": "2023-06-01"}
+    else:
+        endpoint = url.removesuffix("/chat/completions") + "/models"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0)) as client:
+            response = await client.get(endpoint, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+        records = payload.get("models", []) if provider == "ollama" else payload.get("data", [])
+        if not isinstance(records, list):
+            raise ValueError("Invalid models response")
+        models = []
+        seen = set()
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("name") if provider == "ollama" else item.get("id")
+            if not isinstance(model_id, str) or not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            models.append({"id": model_id,
+                           "name": str(item.get("display_name") or item.get("name") or model_id)})
+        return {"provider": provider, "models": models}
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        # Do not leak upstream response bodies, tokens, or internal URLs.
+        raise HTTPException(status_code=502,
+                            detail=f"Could not load {provider} models. Check provider connection and credentials.") from exc
 
 
 async def generate_tokens(settings: dict, history: list[dict]) -> AsyncIterator[str]:
@@ -471,6 +542,7 @@ async def stream_message(thread_id: str, data: MessageInput):
             conn.execute("SELECT provider,model FROM workspace_settings WHERE id=1").fetchone()
         )
         # Check credentials before persisting the user's message.
+        require_model(settings)
         model_credentials(settings)
         prior = [
             {"role": r["role"], "content": r["content"]}
@@ -576,6 +648,7 @@ async def start_assessment(thread_id: str, data: AssessmentInput):
         thread = fetch_or_404(conn, "threads", thread_id)
         settings = dict(conn.execute(
             "SELECT provider,model FROM workspace_settings WHERE id=1").fetchone())
+        require_model(settings)
         model_credentials(settings)
         active = conn.execute(
             "SELECT id FROM assessment_jobs WHERE thread_id=? AND status IN ('queued','running') LIMIT 1",

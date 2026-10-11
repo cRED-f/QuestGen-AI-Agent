@@ -48,6 +48,7 @@ def test_stream_and_database_history(client, monkeypatch):
         yield "a quiz."
 
     monkeypatch.setattr(module, "generate_tokens", fake_generate)
+    client.put("/api/settings", json={"provider": "ollama", "model": "qwen3:8b"})
     thread_id = client.post("/api/threads", json={"course_id": client.get("/api/courses").json()[0]["id"]}).json()["id"]
     events = []
     with client.stream("POST", f"/api/threads/{thread_id}/stream", json={"content": "Build a quiz"}) as response:

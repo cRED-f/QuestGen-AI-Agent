@@ -6,9 +6,11 @@ import {
   ArrowRight,
   ArrowUpRight,
   BookOpenText,
-  ChevronDown,
   ChevronRight,
   Files,
+  Eye,
+  EyeOff,
+  ShieldCheck,
   Paperclip,
   PenLine,
   PencilLine,
@@ -28,6 +30,7 @@ import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } fr
 import ReactMarkdown from "react-markdown";
 import { DocumentPanel, Source, sourceLink } from "@/components/workspace/DocumentPanel";
 import QuestionEditor, { type AssessmentQuestion } from "@/components/workspace/QuestionEditor";
+import PencilSelect from "@/components/workspace/PencilSelect";
 
 type Course = { id: string; name: string; created_at: number };
 type Thread = { id: string; course_id: string; title: string; updated_at: number };
@@ -50,9 +53,34 @@ type AssessmentJob = {
   error: string | null;
 };
 type ModelSettings = {
-  provider: "ollama" | "openrouter" | "openai";
+  provider: "ollama" | "openrouter" | "openai" | "anthropic" | "9router";
   model: string;
 };
+type AvailableModel = { id: string; name: string };
+type ProviderConnection = {
+  provider: ModelSettings["provider"];
+  key_configured: boolean;
+  key_source: "saved" | "environment" | "missing";
+  base_url: string | null;
+  requires_key: boolean;
+};
+const CONNECTION_DEFAULTS: Record<"9router" | "ollama", string> = {
+  "9router": "http://127.0.0.1:20128/v1",
+  ollama: "http://127.0.0.1:11434",
+};
+const PROVIDER_KEY_LINKS: Partial<Record<ModelSettings["provider"], string>> = {
+  "9router": "http://127.0.0.1:20128/dashboard",
+  openai: "https://platform.openai.com/api-keys",
+  anthropic: "https://console.anthropic.com/settings/keys",
+  openrouter: "https://openrouter.ai/settings/keys",
+};
+const PROVIDERS: { value: ModelSettings["provider"]; label: string; detail: string }[] = [
+  { value: "9router", label: "9Router", detail: "Local AI routing gateway" },
+  { value: "openai", label: "OpenAI", detail: "OpenAI API key" },
+  { value: "anthropic", label: "Anthropic", detail: "Claude API key" },
+  { value: "openrouter", label: "OpenRouter", detail: "Multi-provider catalog" },
+  { value: "ollama", label: "Ollama", detail: "Models installed locally" },
+];
 type ChatEvent = {
   type: "started" | "sources" | "delta" | "done" | "error";
   sources?: Source[];
@@ -132,9 +160,22 @@ export default function ChatPage() {
   const [startingExam, setStartingExam] = useState(false);
   const [showAnswers, setShowAnswers] = useState(false);
   const [editingQuestionId, setEditingQuestionId] = useState<string | null>(null);
-  const [settings, setSettings] = useState<ModelSettings>({ provider: "ollama", model: "qwen3:8b" });
+  const [settings, setSettings] = useState<ModelSettings>({ provider: "ollama", model: "" });
   const [settingsDraft, setSettingsDraft] = useState<ModelSettings>(settings);
+  const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState("");
+  const [modelRefresh, setModelRefresh] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [connections, setConnections] = useState<ProviderConnection[]>([]);
+  const [connectionsLoading, setConnectionsLoading] = useState(false);
+  const [providerKey, setProviderKey] = useState("");
+  const [showProviderKey, setShowProviderKey] = useState(false);
+  const [clearProviderKey, setClearProviderKey] = useState(false);
+  const [providerBase, setProviderBase] = useState("");
+  const [connectionFeedback, setConnectionFeedback] = useState("");
+  const [connectionProblem, setConnectionProblem] = useState("");
+  const [testingConnection, setTestingConnection] = useState(false);
   const [documentsOpen, setDocumentsOpen] = useState(false);
   const [courseOpen, setCourseOpen] = useState(false);
   const [courseName, setCourseName] = useState("");
@@ -171,6 +212,34 @@ export default function ChatPage() {
       .finally(() => active && setLoading(false));
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setModelsLoading(true);
+    setModelsError("");
+    setAvailableModels([]);
+    fetch(`${API}/models?provider=${encodeURIComponent(settings.provider)}`, { signal: controller.signal, cache: "no-store" })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Could not load provider models");
+        return data as { models: AvailableModel[] };
+      })
+      .then((result) => setAvailableModels(result.models))
+      .catch((cause: Error) => { if (!controller.signal.aborted) setModelsError(cause.message); })
+      .finally(() => { if (!controller.signal.aborted) setModelsLoading(false); });
+    return () => controller.abort();
+  }, [settings.provider, modelRefresh]);
+
+  const selectModel = async (model: string) => {
+    if (busy || startingExam || model === settings.model) return;
+    try {
+      const updated = await requestJson<ModelSettings>("/settings", {
+        method: "PUT", body: JSON.stringify({ provider: settings.provider, model }),
+      });
+      setSettings(updated);
+      setError("");
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not change model."); }
+  };
 
   useEffect(() => {
     if (!courseId) return;
@@ -304,19 +373,85 @@ export default function ChatPage() {
     }
   };
 
+  const selectedConnection = connections.find((entry) => entry.provider === settingsDraft.provider);
+  const localProvider = settingsDraft.provider === "9router" || settingsDraft.provider === "ollama";
+
+  const openSettings = async () => {
+    setSettingsDraft(settings);
+    setSettingsOpen(true);
+    setConnectionsLoading(true);
+    setProviderKey("");
+    setShowProviderKey(false);
+    setClearProviderKey(false);
+    setConnectionFeedback("");
+    setConnectionProblem("");
+    try {
+      const loaded = await requestJson<ProviderConnection[]>("/provider-connections");
+      setConnections(loaded);
+      setProviderBase(loaded.find((entry) => entry.provider === settings.provider)?.base_url || "");
+    } catch (cause) {
+      setConnectionProblem(cause instanceof Error ? cause.message : "Could not load provider connections.");
+    } finally { setConnectionsLoading(false); }
+  };
+
+  const changeProviderDraft = (provider: ModelSettings["provider"]) => {
+    setSettingsDraft((previous) => ({ ...previous, provider }));
+    setProviderKey("");
+    setShowProviderKey(false);
+    setClearProviderKey(false);
+    setConnectionFeedback("");
+    setConnectionProblem("");
+    setProviderBase(connections.find((entry) => entry.provider === provider)?.base_url ||
+      (provider === "9router" || provider === "ollama" ? CONNECTION_DEFAULTS[provider] : ""));
+  };
+
+  const persistProviderConnection = async () => {
+    const updated = await requestJson<ProviderConnection>(`/provider-connections/${settingsDraft.provider}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        ...(providerKey.trim() ? { api_key: providerKey.trim() } : {}),
+        clear_key: clearProviderKey,
+        ...(localProvider ? { base_url: providerBase.trim() } : {}),
+      }),
+    });
+    setConnections((previous) => [...previous.filter((entry) => entry.provider !== updated.provider), updated]);
+    setProviderKey("");
+    setClearProviderKey(false);
+    return updated;
+  };
+
+  const testProvider = async () => {
+    setTestingConnection(true);
+    setConnectionProblem("");
+    setConnectionFeedback("");
+    try {
+      await persistProviderConnection();
+      const response = await requestJson<{ connected: boolean; models_found: number }>(`/provider-connections/${settingsDraft.provider}/test`, {
+        method: "POST",
+      });
+      setConnectionFeedback(`Connection successful · ${response.models_found} models found. ${settingsDraft.provider === settings.provider ? "Choose one in chat." : "Save provider to use it in chat."}`);
+      if (settingsDraft.provider === settings.provider) setModelRefresh((previous) => previous + 1);
+    } catch (cause) {
+      setConnectionProblem(cause instanceof Error ? cause.message : "Could not connect to this provider.");
+    } finally { setTestingConnection(false); }
+  };
+
   const saveSettings = async (event: FormEvent) => {
     event.preventDefault();
-    if (!settingsDraft.model.trim()) return;
     setSaving(true);
+    setConnectionProblem("");
     try {
+      await persistProviderConnection();
       const updated = await requestJson<ModelSettings>("/settings", {
-        method: "PUT", body: JSON.stringify(settingsDraft),
+        method: "PUT", body: JSON.stringify({ provider: settingsDraft.provider, model: settingsDraft.provider === settings.provider ? settings.model : "" }),
       });
       setSettings(updated);
+      setSettingsDraft(updated);
+      setModelRefresh((previous) => previous + 1);
       setSettingsOpen(false);
       setError("");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not save model settings.");
+      setConnectionProblem(cause instanceof Error ? cause.message : "Could not save model settings.");
     } finally {
       setSaving(false);
     }
@@ -529,13 +664,9 @@ export default function ChatPage() {
               <span className="qg-overline">01 / YOUR COURSE</span>
               <button type="button" onClick={() => setCourseOpen(true)} className="qg-mini-icon" aria-label="Create course" title="Create course"><Plus size={17}/></button>
             </div>
-            <div className="qg-select-wrap">
-              <BookOpenText size={17} className="qg-select-leading" aria-hidden="true" />
-              <select aria-label="Selected course" value={courseId} disabled={busy} onChange={(event) => setCourseId(event.target.value)} className="qg-course-select">
-                {courses.map((course) => <option key={course.id} value={course.id}>{course.name}</option>)}
-              </select>
-              <ChevronDown size={16} className="qg-select-trailing" aria-hidden="true" />
-            </div>
+            <PencilSelect ariaLabel="Your course" placement="sidebar" value={courseId} disabled={busy}
+              options={courses.map((course) => ({ value: course.id, label: course.name }))}
+              onChange={setCourseId} placeholder="Choose a course"/>
           </div>
 
           <div className="qg-side-section qg-library-section">
@@ -563,9 +694,9 @@ export default function ChatPage() {
         </div>
 
         <div className="qg-sidebar-foot">
-          <button type="button" className="qg-settings-link" onClick={() => { setSettingsDraft(settings); setSettingsOpen(true); }}>
+          <button type="button" className="qg-settings-link" onClick={() => void openSettings()}>
             <span className="qg-settings-icon"><Settings2 size={19}/></span>
-            <span className="qg-settings-copy"><strong>Model settings</strong><small>{settings.provider} · {settings.model}</small></span>
+            <span className="qg-settings-copy"><strong>Model settings</strong><small>{PROVIDERS.find((item) => item.value === settings.provider)?.label} · {settings.model || "Choose model in chat"}</small></span>
             <ChevronRight size={17} aria-hidden="true"/>
           </button>
           <div className="qg-local-label"><span className="qg-status-dot"/> LOCAL WORKSPACE <span className="qg-local-version">V2.0</span></div>
@@ -582,9 +713,11 @@ export default function ChatPage() {
           <div className="qg-topbar-right">
             <span className="qg-current-label" title={currentThread?.title || "New conversation"}>{currentThread?.title || "Untitled conversation"}</span>
             <button type="button" className="qg-topbar-button" onClick={() => setDocumentsOpen(true)} disabled={!courseId}><Files size={17}/><span>Materials</span></button>
-            <button type="button" className="qg-model-badge" onClick={() => { setSettingsDraft(settings); setSettingsOpen(true); }} title="Change model">
-              <span className="qg-model-dot"/><span>{settings.model}</span><ChevronDown size={14}/>
-            </button>
+            <PencilSelect ariaLabel={`${PROVIDERS.find((item) => item.value === settings.provider)?.label || "Provider"} models`} placement="topbar" value={settings.model}
+              placeholder="Choose a model" disabled={busy || startingExam}
+              options={availableModels.map((item) => ({ value: item.id, label: item.name, detail: item.id }))}
+              searchable loading={modelsLoading} error={modelsError}
+              onRefresh={() => setModelRefresh((previous) => previous + 1)} onChange={(id) => void selectModel(id)}/>
           </div>
         </header>
 
@@ -694,7 +827,7 @@ export default function ChatPage() {
               {error && <div role="alert" className="qg-error"><AlertCircle size={17}/><span>{error}</span><button type="button" aria-label="Dismiss error" onClick={() => setError("")}><X size={17}/></button></div>}
               <form className="qg-composer" onSubmit={onSubmit}>
                 <div className="qg-composer-topline"><span>YOUR NEXT THOUGHT</span><span className="qg-compose-line"/></div>
-                <textarea ref={textRef} rows={2} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || !courseId} aria-label="Message QuestGen" placeholder={assessment?.status === "completed" ? "e.g. Make question 2 harder, or lock question 1…" : "Ask a question, refine an idea, or plan an assessment…"}/>
+                <textarea ref={textRef} rows={2} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || !courseId || !settings.model} aria-label="Message QuestGen" placeholder={!settings.model ? "Choose a model in the top bar to begin…" : assessment?.status === "completed" ? "e.g. Make question 2 harder, or lock question 1…" : "Ask a question, refine an idea, or plan an assessment…"}/>
                 <div className="qg-composer-actions">
                   <button type="button" onClick={() => setDocumentsOpen(true)} disabled={!courseId} className="qg-attach"><Paperclip size={17}/><span>Attach course material</span></button>
                   <span className="qg-keyboard-tip">↵ to send · shift ↵ for new line</span>
@@ -702,13 +835,13 @@ export default function ChatPage() {
                     disabled={!input.trim() || busy || startingExam || editingQuestionId !== null} title="Apply conversational edits to question(s) in this assessment">
                     <PencilLine size={15}/> Apply to draft
                   </button>}
-                  <button type="button" className="qg-assessment-action" onClick={() => void startAssessment()} disabled={!input.trim() || !courseId || busy || startingExam || assessment?.status === "running" || assessment?.status === "queued"} title="Generate a structured assessment from these instructions">
+                  <button type="button" className="qg-assessment-action" onClick={() => void startAssessment()} disabled={!input.trim() || !courseId || !settings.model || busy || startingExam || assessment?.status === "running" || assessment?.status === "queued"} title="Generate a structured assessment from these instructions">
                     {startingExam ? <Loader2 size={15} className="qg-spin"/> : <ClipboardList size={16}/>} Generate exam
                   </button>
                   {busy ? (
                     <button type="button" onClick={() => abortRef.current?.abort()} className="qg-send" title="Stop response" aria-label="Stop response"><Square size={15} fill="currentColor"/></button>
                   ) : (
-                    <button type="submit" disabled={!input.trim() || !courseId} className="qg-send" aria-label="Send message"><ArrowUp size={21}/></button>
+                    <button type="submit" disabled={!input.trim() || !courseId || !settings.model} className="qg-send" aria-label="Send message"><ArrowUp size={21}/></button>
                   )}
                 </div>
               </form>
@@ -722,23 +855,62 @@ export default function ChatPage() {
       {(settingsOpen || courseOpen) && (
         <div className="qg-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) { setSettingsOpen(false); setCourseOpen(false); } }}>
           <div role="dialog" aria-modal="true" aria-label={settingsOpen ? "Model settings" : "New course"} className="qg-dialog">
-            <div className="qg-dialog-head"><div><span className="qg-overline">WORKSPACE PREFERENCES</span><h2>{settingsOpen ? "Model settings" : "New course"}</h2></div><button type="button" className="qg-icon-button" aria-label="Close dialog" onClick={() => { setSettingsOpen(false); setCourseOpen(false); }}><X size={19}/></button></div>
+            <div className="qg-dialog-head"><div><span className="qg-overline">{settingsOpen ? "MODEL PREFERENCES" : "YOUR COURSE LIBRARY"}</span><h2>{settingsOpen ? "Choose a provider" : "New course"}</h2></div><button type="button" className="qg-icon-button" aria-label="Close dialog" onClick={() => { setSettingsOpen(false); setCourseOpen(false); }}><X size={19}/></button></div>
             {settingsOpen ? (
-              <form onSubmit={saveSettings} className="qg-dialog-form">
-                <label htmlFor="provider">AI provider</label>
-                <select id="provider" value={settingsDraft.provider} onChange={(event) => {
-                  const provider = event.target.value as ModelSettings["provider"];
-                  setSettingsDraft({ provider, model: provider === "ollama" ? "qwen3:8b" : provider === "openrouter" ? "openai/gpt-4o-mini" : "gpt-4o-mini" });
-                }}><option value="ollama">Ollama (local)</option><option value="openrouter">OpenRouter</option><option value="openai">OpenAI</option></select>
-                <label htmlFor="model">Model identifier</label>
-                <input id="model" required maxLength={120} value={settingsDraft.model} onChange={(event) => setSettingsDraft((previous) => ({ ...previous, model: event.target.value }))} placeholder="e.g. qwen3:8b"/>
-                <p className="qg-form-help">API keys are configured on the backend, not stored in the browser. For Ollama, make sure the local server is running.</p>
-                <button type="submit" className="qg-primary-submit" disabled={saving || busy || !settingsDraft.model.trim()}>{saving ? "Saving…" : "Save model settings"} <ArrowRight size={17}/></button>
+              <form onSubmit={saveSettings} className="qg-dialog-form qg-connection-form">
+                <label>AI provider</label>
+                <PencilSelect ariaLabel="AI provider" placement="dialog" value={settingsDraft.provider}
+                  options={PROVIDERS.map((provider) => ({ value: provider.value, label: provider.label, detail: provider.detail }))}
+                  onChange={(provider) => changeProviderDraft(provider as ModelSettings["provider"])}/>
+                <div className="qg-connection-status">
+                  <ShieldCheck size={16} aria-hidden="true"/>
+                  <span>{connectionsLoading ? "Checking configuration…" :
+                    selectedConnection?.key_source === "saved" ? "API key saved on this device" :
+                    selectedConnection?.key_source === "environment" ? "API key provided by server environment" :
+                    selectedConnection?.requires_key ? "API key not configured" :
+                    "API key optional for local connection"}</span>
+                </div>
+                <div className="qg-field-heading">
+                  <label htmlFor="provider-api-key">API key {selectedConnection?.requires_key ? <span className="qg-required">required</span> : <span className="qg-optional">optional</span>}</label>
+                  {PROVIDER_KEY_LINKS[settingsDraft.provider] && <a href={PROVIDER_KEY_LINKS[settingsDraft.provider]} target="_blank" rel="noopener noreferrer">Get API key <ArrowUpRight size={12}/></a>}
+                </div>
+                <div className="qg-secret-input">
+                  <input id="provider-api-key" type={showProviderKey ? "text" : "password"}
+                    autoComplete="new-password" spellCheck={false} maxLength={2048}
+                    value={providerKey} disabled={connectionsLoading || clearProviderKey}
+                    onChange={(event) => setProviderKey(event.target.value)}
+                    placeholder={selectedConnection?.key_configured ? "Saved · enter to replace" : "Paste API key here"}/>
+                  <button type="button" className="qg-visibility-toggle" aria-label={showProviderKey ? "Hide API key" : "Show API key"}
+                    onClick={() => setShowProviderKey((visible) => !visible)}>{showProviderKey ? <EyeOff size={16}/> : <Eye size={16}/>}</button>
+                </div>
+                <p className="qg-connection-help">{settingsDraft.provider === "ollama" ? "Local Ollama normally needs no key; use this only for an authenticated proxy." :
+                  settingsDraft.provider === "9router" ? "Copy the API key from the 9Router dashboard. Leave blank only if your gateway allows it." :
+                  "Stored on the local Python backend. Leave blank to keep your current key."}</p>
+                {selectedConnection?.key_source === "saved" && <label className="qg-clear-key"><input type="checkbox" checked={clearProviderKey}
+                  onChange={(event) => { setClearProviderKey(event.target.checked); if (event.target.checked) setProviderKey(""); }}/>
+                  Remove saved API key</label>}
+                {localProvider && <>
+                  <label htmlFor="provider-base-url">API base URL</label>
+                  <input id="provider-base-url" type="url" required spellCheck={false} autoCapitalize="none" maxLength={500}
+                    value={providerBase} onChange={(event) => setProviderBase(event.target.value)}
+                    placeholder={CONNECTION_DEFAULTS[settingsDraft.provider as "9router" | "ollama"]}/>
+                  <p className="qg-connection-help">{settingsDraft.provider === "9router" ? "9Router default: http://127.0.0.1:20128/v1" : "Ollama default: http://127.0.0.1:11434"}. Remote connections require HTTPS.</p>
+                </>}
+                <div className="qg-dialog-note"><PenLine size={17}/><p>Provider credentials go to the local backend only. After connecting, choose an available model in the chat header. No model ID to enter here.</p></div>
+                {connectionProblem && <p className="qg-connection-feedback qg-connection-feedback--bad" role="alert">{connectionProblem}</p>}
+                {connectionFeedback && <p className="qg-connection-feedback qg-connection-feedback--good" role="status">{connectionFeedback}</p>}
+                <div className="qg-connection-actions">
+                  <button type="button" className="qg-test-provider" onClick={() => void testProvider()}
+                    disabled={saving || testingConnection || connectionsLoading}>{testingConnection ? "Testing…" : "Save & test connection"}</button>
+                  <button type="submit" className="qg-primary-submit" disabled={saving || testingConnection || connectionsLoading || busy}>
+                    {saving ? "Saving…" : "Save provider"} <ArrowRight size={17}/>
+                  </button>
+                </div>
               </form>
             ) : (
               <form onSubmit={addCourse} className="qg-dialog-form">
                 <label htmlFor="course-name">Course name</label>
-                <input id="course-name" autoFocus required maxLength={80} value={courseName} onChange={(event) => setCourseName(event.target.value)} placeholder="e.g. Data Structures"/>
+                <input id="course-name" autoFocus required maxLength={80} autoComplete="off" value={courseName} onChange={(event) => setCourseName(event.target.value)} placeholder="e.g. Data Structures"/>
                 <button type="submit" className="qg-primary-submit" disabled={saving || !courseName.trim()}>{saving ? "Creating…" : "Create course"} <ArrowRight size={17}/></button>
               </form>
             )}
