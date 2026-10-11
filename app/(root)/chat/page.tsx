@@ -13,7 +13,10 @@ import {
   ShieldCheck,
   Paperclip,
   PenLine,
+  RefreshCw,
   PencilLine,
+  Pencil,
+  Check,
   Loader2,
   ClipboardList,
   RotateCcw,
@@ -181,6 +184,8 @@ export default function ChatPage() {
   const [courseName, setCourseName] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [input, setInput] = useState("");
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [deletingThreadId, setDeletingThreadId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -188,6 +193,7 @@ export default function ChatPage() {
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLElement | null>(null);
   const textRef = useRef<HTMLTextAreaElement | null>(null);
+  const savedComposerDraftRef = useRef("");
   const currentCourse = courses.find((course) => course.id === courseId);
   const currentThread = threads.find((thread) => thread.id === threadId);
 
@@ -249,6 +255,9 @@ export default function ChatPage() {
     setDocumentsOpen(false);
     setThreadId(null);
     setMessages([]);
+    setEditingMessageId(null);
+    setInput((current) => editingMessageId ? savedComposerDraftRef.current : current);
+    savedComposerDraftRef.current = "";
     setAssessment(null);
     setActivities([]);
     refreshThreads(courseId).then((available) => {
@@ -315,10 +324,22 @@ export default function ChatPage() {
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
+  useEffect(() => {
+    // Editing uses the regular chat composer rather than an inline message form.
+    if (!editingMessageId) return;
+    const textarea = textRef.current;
+    if (!textarea) return;
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  }, [editingMessageId]);
+
   const beginNewChat = () => {
     if (busy) return;
     setThreadId(null);
     setMessages([]);
+    setEditingMessageId(null);
+    setInput((current) => editingMessageId ? savedComposerDraftRef.current : current);
+    savedComposerDraftRef.current = "";
     setAssessment(null);
     setActivities([]);
     setError("");
@@ -331,6 +352,9 @@ export default function ChatPage() {
     if (busy || id === threadId) return;
     setError("");
     setThreadId(id);
+    setEditingMessageId(null);
+    if (editingMessageId) setInput(savedComposerDraftRef.current);
+    savedComposerDraftRef.current = "";
     setAssessment(null);
     setActivities([]);
     setSidebarOpen(false);
@@ -343,14 +367,16 @@ export default function ChatPage() {
   };
 
   const deleteThread = async (id: string) => {
-    if (busy || !window.confirm("Delete this conversation and all of its messages?")) return;
+    if (busy || deletingThreadId) return;
+    setDeletingThreadId(id);
     try {
       await requestJson<void>(`/threads/${id}`, { method: "DELETE" });
+      setThreads((previous) => previous.filter((item) => item.id !== id));
       if (threadId === id) beginNewChat();
       await refreshThreads(courseId);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not delete conversation.");
-    }
+    } finally { setDeletingThreadId(null); }
   };
 
   const addCourse = async (event: FormEvent) => {
@@ -457,23 +483,44 @@ export default function ChatPage() {
     }
   };
 
-  const send = async (value = input) => {
+  // Editing a user turn or regenerating a reply replaces its later messages.
+  // Persisted message IDs are used so the backend can update the correct turn.
+  const send = async (
+    value = input,
+    action?: { edit_message_id?: string; regenerate_message_id?: string },
+  ) => {
     const content = value.trim();
-    if (!content || !courseId || busy) return;
+    if ((!content && !action?.regenerate_message_id) || !courseId || busy || startingExam ||
+        (editingMessageId !== null && action?.edit_message_id !== editingMessageId)) return;
+    if (action && !threadId) return;
     const existingId = threadId;
     setBusy(true);
     setError("");
-    setInput("");
+    if (!action) setInput("");
+    let editWasAccepted = false;
     const controller = new AbortController();
     abortRef.current = controller;
     let activeId = existingId;
+    const timestamp = Date.now();
     const user: ChatMessage = {
-      id: `pending-user-${Date.now()}`, role: "user", content, created_at: Date.now() / 1000,
+      id: `pending-user-${timestamp}`, role: "user", content, created_at: timestamp / 1000,
     };
     const answer: ChatMessage = {
-      id: `pending-answer-${Date.now()}`, role: "assistant", content: "", created_at: Date.now() / 1000,
+      id: `pending-answer-${timestamp}`, role: "assistant", content: "", created_at: timestamp / 1000,
     };
-    setMessages((previous) => [...previous, user, answer]);
+    setMessages((previous) => {
+      if (action?.edit_message_id) {
+        const index = previous.findIndex((item) => item.id === action.edit_message_id);
+        if (index < 0) return previous;
+        return [...previous.slice(0, index), { ...previous[index], content }, answer];
+      }
+      if (action?.regenerate_message_id) {
+        const index = previous.findIndex((item) => item.id === action.regenerate_message_id);
+        if (index < 0) return previous;
+        return [...previous.slice(0, index), answer];
+      }
+      return [...previous, user, answer];
+    });
     try {
       if (!activeId) {
         const created = await requestJson<Thread>("/threads", {
@@ -488,13 +535,19 @@ export default function ChatPage() {
       const response = await fetch(`${API}/threads/${activeId}/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({
+          ...(action?.regenerate_message_id ? {} : { content }),
+          ...action,
+        }),
         signal: controller.signal,
       });
       if (!response.ok) {
         const payload = await response.json().catch(() => ({}));
         throw new Error(payload.detail || `Could not send message (${response.status})`);
       }
+      // The server has accepted the edit and updated the saved conversation.
+      // Even if the provider subsequently fails, this edit no longer exists as a pending request.
+      if (action?.edit_message_id) editWasAccepted = true;
       await readEvents(response, (event) => {
         if (event.type === "started" && event.user_id) {
           setMessages((previous) => previous.map((item) => item.id === user.id ? { ...item, id: event.user_id! } : item));
@@ -517,6 +570,11 @@ export default function ChatPage() {
     } finally {
       abortRef.current = null;
       setBusy(false);
+      if (editWasAccepted) {
+        setEditingMessageId(null);
+        setInput(savedComposerDraftRef.current);
+        savedComposerDraftRef.current = "";
+      }
       if (activeId) {
         try {
           const [saved] = await Promise.all([
@@ -530,6 +588,24 @@ export default function ChatPage() {
       }
       textRef.current?.focus();
     }
+  };
+
+  const editChatMessage = (message: ChatMessage) => {
+    if (busy || startingExam || message.id.startsWith("pending-")) return;
+    // Keep the unsent draft so Cancel (or a completed edit) can restore it.
+    if (!editingMessageId) savedComposerDraftRef.current = input;
+    setEditingMessageId(message.id);
+    setInput(message.content);
+    setError("");
+  };
+
+  const cancelMessageEdit = () => {
+    if (!editingMessageId || busy) return;
+    setEditingMessageId(null);
+    setInput(savedComposerDraftRef.current);
+    savedComposerDraftRef.current = "";
+    setError("");
+    textRef.current?.focus();
   };
 
   const startAssessment = async () => {
@@ -632,11 +708,17 @@ export default function ChatPage() {
     } finally { setStartingExam(false); }
   };
 
-  const onSubmit = (event: FormEvent) => { event.preventDefault(); void send(); };
+  const sendFromComposer = () => {
+    void send(input, editingMessageId ? { edit_message_id: editingMessageId } : undefined);
+  };
+  const onSubmit = (event: FormEvent) => { event.preventDefault(); sendFromComposer(); };
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+    if (event.key === "Escape" && editingMessageId) {
       event.preventDefault();
-      void send();
+      cancelMessageEdit();
+    } else if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      sendFromComposer();
     }
   };
 
@@ -686,7 +768,7 @@ export default function ChatPage() {
                   <button type="button" className="qg-history-select" onClick={() => void openThread(thread.id)} disabled={busy} title={thread.title}>
                     <MessageSquareText size={16} strokeWidth={1.65}/><span>{thread.title}</span>
                   </button>
-                  <button type="button" className="qg-history-delete" onClick={() => void deleteThread(thread.id)} disabled={busy} aria-label={`Delete ${thread.title}`} title="Delete conversation"><Trash2 size={15}/></button>
+                  <button type="button" className="qg-history-delete" onClick={() => void deleteThread(thread.id)} disabled={busy || deletingThreadId !== null} aria-label={`Delete ${thread.title}`} title="Delete conversation"><Trash2 size={15}/></button>
                 </div>
               ))}
             </nav>
@@ -755,7 +837,10 @@ export default function ChatPage() {
                       <div className="qg-message-content">
                         <div className="qg-message-label">{message.role === "assistant" ? "QUESTGEN" : "YOU"}</div>
                         {message.role === "user" ? (
-                          <div className="qg-user-note">{message.content}</div>
+                          <>
+                            <div className={`qg-user-note ${editingMessageId === message.id ? "qg-user-note--editing" : ""}`}>{message.content}</div>
+                            {editingMessageId === message.id && <div className="qg-message-editing-indicator"><Pencil size={12}/> Editing in the message box below</div>}
+                          </>
                         ) : (
                           <div className="qg-assistant-text questgen-prose">
                             {message.content ? <ReactMarkdown>{message.content}</ReactMarkdown> : <span className="qg-thinking"><Loader2 size={15} className="qg-spin"/> Thinking through your question…</span>}
@@ -770,6 +855,20 @@ export default function ChatPage() {
                                   ))}
                                 </div>
                               </div>
+                            )}
+                          </div>
+                        )}
+                        {!busy && !startingExam && !editingMessageId && !message.id.startsWith("pending-") && (
+                          <div className={`qg-message-tools ${message.role === "user" ? "qg-message-tools--user" : ""}`}>
+                            {message.role === "user" ? (
+                              <button type="button" onClick={() => editChatMessage(message)} title="Edit this message" aria-label="Edit message">
+                                <Pencil size={14}/> <span>Edit</span>
+                              </button>
+                            ) : (
+                              <button type="button" onClick={() => void send("", { regenerate_message_id: message.id })}
+                                title="Regenerate this response" aria-label="Regenerate response">
+                                <RefreshCw size={14}/> <span>Regenerate</span>
+                              </button>
                             )}
                           </div>
                         )}
@@ -825,23 +924,35 @@ export default function ChatPage() {
           <div className="qg-compose-region">
             <div className="qg-compose-inner">
               {error && <div role="alert" className="qg-error"><AlertCircle size={17}/><span>{error}</span><button type="button" aria-label="Dismiss error" onClick={() => setError("")}><X size={17}/></button></div>}
-              <form className="qg-composer" onSubmit={onSubmit}>
-                <div className="qg-composer-topline"><span>YOUR NEXT THOUGHT</span><span className="qg-compose-line"/></div>
-                <textarea ref={textRef} rows={2} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || !courseId || !settings.model} aria-label="Message QuestGen" placeholder={!settings.model ? "Choose a model in the top bar to begin…" : assessment?.status === "completed" ? "e.g. Make question 2 harder, or lock question 1…" : "Ask a question, refine an idea, or plan an assessment…"}/>
+              <form className={`qg-composer ${editingMessageId ? "qg-composer--editing" : ""}`} onSubmit={onSubmit}>
+                <div className="qg-composer-topline"><span>{editingMessageId ? "EDIT MESSAGE" : "YOUR NEXT THOUGHT"}</span><span className="qg-compose-line"/></div>
+                {editingMessageId && (
+                  <div className="qg-composer-edit-banner" role="status">
+                    <span><Pencil size={14}/> Editing your earlier message. Later replies will be replaced.</span>
+                    <button type="button" onClick={cancelMessageEdit} disabled={busy} aria-label="Cancel message editing"><X size={14}/> Cancel</button>
+                  </div>
+                )}
+                <textarea ref={textRef} rows={2} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || !courseId || !settings.model} aria-label={editingMessageId ? "Edit message in composer" : "Message QuestGen"} placeholder={!settings.model ? "Choose a model in the top bar to begin…" : assessment?.status === "completed" ? "e.g. Make question 2 harder, or lock question 1…" : "Ask a question, refine an idea, or plan an assessment…"}/>
                 <div className="qg-composer-actions">
-                  <button type="button" onClick={() => setDocumentsOpen(true)} disabled={!courseId} className="qg-attach"><Paperclip size={17}/><span>Attach course material</span></button>
-                  <span className="qg-keyboard-tip">↵ to send · shift ↵ for new line</span>
-                  {assessment?.status === "completed" && <button type="button" className="qg-assessment-action" onClick={() => void customizeAssessment()}
-                    disabled={!input.trim() || busy || startingExam || editingQuestionId !== null} title="Apply conversational edits to question(s) in this assessment">
-                    <PencilLine size={15}/> Apply to draft
-                  </button>}
-                  <button type="button" className="qg-assessment-action" onClick={() => void startAssessment()} disabled={!input.trim() || !courseId || !settings.model || busy || startingExam || assessment?.status === "running" || assessment?.status === "queued"} title="Generate a structured assessment from these instructions">
-                    {startingExam ? <Loader2 size={15} className="qg-spin"/> : <ClipboardList size={16}/>} Generate exam
-                  </button>
+                  {editingMessageId ? (
+                    <span className="qg-edit-help">Enter to save · Shift+Enter for new line · Esc to cancel</span>
+                  ) : (
+                    <>
+                      <button type="button" onClick={() => setDocumentsOpen(true)} disabled={!courseId} className="qg-attach"><Paperclip size={17}/><span>Attach course material</span></button>
+                      <span className="qg-keyboard-tip">↵ to send · shift ↵ for new line</span>
+                      {assessment?.status === "completed" && <button type="button" className="qg-assessment-action" onClick={() => void customizeAssessment()}
+                        disabled={!input.trim() || busy || startingExam || editingQuestionId !== null} title="Apply conversational edits to question(s) in this assessment">
+                        <PencilLine size={15}/> Apply to draft
+                      </button>}
+                      <button type="button" className="qg-assessment-action" onClick={() => void startAssessment()} disabled={!input.trim() || !courseId || !settings.model || busy || startingExam || assessment?.status === "running" || assessment?.status === "queued"} title="Generate a structured assessment from these instructions">
+                        {startingExam ? <Loader2 size={15} className="qg-spin"/> : <ClipboardList size={16}/>} Generate exam
+                      </button>
+                    </>
+                  )}
                   {busy ? (
                     <button type="button" onClick={() => abortRef.current?.abort()} className="qg-send" title="Stop response" aria-label="Stop response"><Square size={15} fill="currentColor"/></button>
                   ) : (
-                    <button type="submit" disabled={!input.trim() || !courseId || !settings.model} className="qg-send" aria-label="Send message"><ArrowUp size={21}/></button>
+                    <button type="submit" disabled={!input.trim() || !courseId || !settings.model} className="qg-send" aria-label={editingMessageId ? "Save edit and regenerate response" : "Send message"} title={editingMessageId ? "Save edit & regenerate" : "Send message"}>{editingMessageId ? <Check size={20}/> : <ArrowUp size={21}/>}</button>
                   )}
                 </div>
               </form>

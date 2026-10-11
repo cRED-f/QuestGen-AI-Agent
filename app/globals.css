@@ -139,6 +139,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .qg-assistant-symbol { display: flex; flex: 0 0 34px; height: 34px; align-items: center; justify-content: center; border: 1px solid #d4d8cc; border-radius: 9px; background: #f1f3eb; color: #687663; }
 .qg-user-note { white-space: pre-wrap; overflow-wrap: anywhere; padding: 16px 18px; border: 1px solid #e4d7bd; border-radius: 9px 9px 4px 9px; background: #f6eedc; box-shadow: 2px 3px 0 #eae3d3; color: #41443e; font-size: 13.5px; line-height: 1.8; }
 .qg-assistant-text { padding-top: 1px; color: #444942; font-size: 14px; line-height: 1.88; overflow-wrap: anywhere; }
+/* Conversation actions use the same quiet paper-and-pencil language as the editor. */
+.qg-message-tools { display: flex; align-items: center; margin-top: 9px; gap: 5px; }
+.qg-message-tools--user { justify-content: flex-end; }
+.qg-message-tools button { display: inline-flex; gap: 6px; align-items: center; padding: 5px 8px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #797f74; font-size: 11px; font-weight: 650; transition: background .15s, color .15s; }
+.qg-message-tools button:hover, .qg-message-tools button:focus-visible { background: #eef0e8; color: #435942; border-color: #d9ddcf; }
+.qg-user-note--editing { border-color: #8fa58a; background: #f1f4e8; box-shadow: 2px 3px 0 #dce7d9; }
+.qg-message-editing-indicator { display: flex; justify-content: flex-end; align-items: center; gap: 6px; padding-top: 8px; font-size: 10px; font-weight: 650; color: #70836c; }
+.qg-composer.qg-composer--editing { border-color: #a0b19a; background: #fffefa; box-shadow: 3px 4px 0 #dfe9db, 0 8px 29px #4b55440b; }
+.qg-composer-edit-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 10px 0 1px; padding: 9px 10px; border: 1px solid #dce4d7; border-radius: 7px; background: #f1f5ec; color: #5d7058; font-size: 11px; line-height: 1.5; }
+.qg-composer-edit-banner span { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.qg-composer-edit-banner svg { flex-shrink: 0; }
+.qg-composer-edit-banner button { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; background: transparent; border: 0; border-radius: 5px; padding: 5px; color: #53664f; font-size: 11px; font-weight: 700; }
+.qg-composer-edit-banner button:hover:not(:disabled), .qg-composer-edit-banner button:focus-visible { background: #e2eadc; }
+.qg-composer-edit-banner button:disabled { opacity: .4; }
+.qg-edit-help { margin-left: auto; color: #869383; font-size: 10px; }
 .qg-thinking { display: inline-flex; align-items: center; gap: 10px; color: #7e8a7c; font-size: 13px; }
 .qg-citations { margin-top: 22px; border-top: 1px dashed #d7d6cd; padding-top: 16px; }
 .qg-citations-title { display: flex; align-items: center; gap: 7px; color: #9c9e90; font-size: 10px; font-weight: 750; letter-spacing: 1.25px; }

@@ -41,6 +41,7 @@ export function DocumentPanel({ courseId, onClose }: { courseId: string; onClose
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [loadingSearch, setLoadingSearch] = useState(false);
   const [error, setError] = useState("");
+  const [removingId, setRemovingId] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const requestSeq = useRef(0);
 
@@ -96,12 +97,18 @@ export function DocumentPanel({ courseId, onClose }: { courseId: string; onClose
   };
 
   const remove = async (id: string) => {
-    if (!window.confirm("Delete this document and its searchable passages from this course?")) return;
+    if (removingId) return;
+    setRemovingId(id);
     setError("");
-    const response = await fetch(`${API}/courses/${encodeURIComponent(courseId)}/documents/${id}`, { method: "DELETE" });
-    if (!response.ok) { setError("Could not delete document."); return; }
-    setResults((old) => old.filter((item) => item.document_id !== id));
-    void refresh().catch((cause: Error) => setError(cause.message));
+    try {
+      const response = await fetch(`${API}/courses/${encodeURIComponent(courseId)}/documents/${id}`, { method: "DELETE" });
+      if (!response.ok) throw new Error("Could not delete document.");
+      setItems((old) => old.filter((item) => item.id !== id));
+      setResults((old) => old.filter((item) => item.document_id !== id));
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not delete document.");
+    } finally { setRemovingId(null); }
   };
 
   const runSearch = async () => {
@@ -156,7 +163,7 @@ export function DocumentPanel({ courseId, onClose }: { courseId: string; onClose
                   </div>
                   <div className="qg-file-actions">
                     <a className="qg-mini-icon" href={`${API}/courses/${encodeURIComponent(courseId)}/documents/${encodeURIComponent(doc.id)}/file`} target="_blank" rel="noopener noreferrer" title={`Open ${doc.filename}`} aria-label={`Open ${doc.filename}`}><ArrowUpRight size={17}/></a>
-                    <button type="button" className="qg-mini-icon qg-danger-hover" onClick={() => void remove(doc.id)} aria-label={`Delete ${doc.filename}`} title="Delete file"><Trash2 size={16}/></button>
+                    <button type="button" className="qg-mini-icon qg-danger-hover" onClick={() => void remove(doc.id)} disabled={removingId !== null} aria-label={`Delete ${doc.filename}`} title="Delete file"><Trash2 size={16}/></button>
                   </div>
                 </div>
               ))}
