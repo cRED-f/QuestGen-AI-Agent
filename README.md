@@ -1,5 +1,9 @@
 # QuestGen-AI
 
+> **2026 Phase 2:** QuestGen now supports a chat-first workspace, course documents, durable uploads, PDF/DOCX/TXT/MD text extraction, searchable citations, background indexing, and a Next.js **16.4.0 / React 19.3.0** frontend. Apply Phase 1 then Phase 2 and follow [PHASE2.md](PHASE2.md) for installation and limitations. **No authentication**; keep this version on trusted local infrastructure. The 2025 generation pipeline remains disconnected.
+
+> **2026 Phase 1 update:** This branch now opens directly into a conversation-based QuestGen workspace. It includes locally persisted courses, chat history, streaming model chat, and model settings **without authentication**. Read [PHASE1.md](PHASE1.md) for current setup, tests, scope, and local-only deployment restrictions. The sections below document the original 2025 generation pipeline, which is not connected to the new chat interface; its legacy `/api/generate-questions` endpoint is disabled (HTTP 410).
+
 QuestGen-AI is an advanced exam question generation platform that leverages AI-Agent to automatically create customized question papers from user-uploaded PDF content. Built for educators and assessment creators, QuestGen-AI streamlines the often time-consuming process of creating high-quality assessment materials.
 
 https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a

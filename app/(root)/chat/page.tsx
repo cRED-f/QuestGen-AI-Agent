@@ -1,653 +1,530 @@
 "use client";
 
-import { InteractiveHoverButton } from "@/components/eldoraui/interactivebutton";
-import { Inputp } from "@/components/ui/apikeyinput";
-import { ColourfulText } from "@/components/ui/colourful-text";
-import { FileUpload } from "@/components/ui/file-upload";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { MainMenusGradientCard } from "@/components/eldoraui/animatedcard";
-import { ArrowButton } from "@/components/eldoraui/arrowbutton";
-import Link from "next/link";
-import { motion, AnimatePresence } from "framer-motion";
+import {
+  AlertCircle,
+  ArrowUp,
+  ArrowRight,
+  ArrowUpRight,
+  BookOpenText,
+  ChevronDown,
+  ChevronRight,
+  Files,
+  Paperclip,
+  PenLine,
+  PencilLine,
+  Loader2,
+  Menu,
+  MessageSquareText,
+  Plus,
+  Settings2,
+  Square,
+  Trash2,
+  X,
+} from "lucide-react";
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import React, { useState, useEffect, useRef } from "react";
-import { ChevronDown } from "lucide-react";
+import { DocumentPanel, Source, sourceLink } from "@/components/workspace/DocumentPanel";
 
-function Page() {
-  const [files, setFiles] = useState<File[]>([]);
-  const [questionHeader, setQuestionHeader] = useState("");
-  const [questionDescription, setQuestionDescription] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [modelName, setModelName] = useState("qwen/qwq-32b:free");
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [isFormSubmitted, setIsFormSubmitted] = useState(false);
-  const [isAnimating, setIsAnimating] = useState(false);
-  const [generatedContent, setGeneratedContent] = useState("");
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [uploadedFileNames, setUploadedFileNames] = useState<string[]>([]);
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const [typingText, setTypingText] = useState("");
-  const [isTypingComplete, setIsTypingComplete] = useState(false);
-  const [displayedContentLength, setDisplayedContentLength] = useState(0);
-  const typingSpeed = 5; // Characters per frame
-  const typingInterval = useRef<NodeJS.Timeout | null>(null);
-  const [showScrollButton, setShowScrollButton] = useState(false);
-  const contentRef = useRef<HTMLDivElement>(null);
-  const lastScrollPosition = useRef(0);
-  const scrolling = useRef(false);
+type Course = { id: string; name: string; created_at: number };
+type Thread = { id: string; course_id: string; title: string; updated_at: number };
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  created_at: number;
+  sources?: Source[];
+};
+type ModelSettings = {
+  provider: "ollama" | "openrouter" | "openai";
+  model: string;
+};
+type ChatEvent = {
+  type: "started" | "sources" | "delta" | "done" | "error";
+  sources?: Source[];
+  user_id?: string;
+  message_id?: string;
+  content?: string;
+  message?: string;
+};
 
-  const handleFileUpload = (files: File[]) => {
-    setFiles(files);
+const API = "/api/workspace";
+const SUGGESTIONS = [
+  "Design a 40-mark midterm assessment for a data structures course",
+  "Suggest a Bloom's taxonomy distribution for a university exam",
+  "Help me improve the clarity of my multiple-choice questions",
+];
+
+async function requestJson<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await fetch(`${API}${path}`, {
+    ...options,
+    headers: { "Content-Type": "application/json", ...options?.headers },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result.detail || `Request failed (${response.status})`);
+  }
+  return response.status === 204 ? (undefined as T) : ((await response.json()) as T);
+}
+
+async function readEvents(
+  response: Response,
+  onEvent: (event: ChatEvent) => void,
+): Promise<void> {
+  if (!response.body) throw new Error("Streaming is unavailable in this browser.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let completed = false;
+  const dispatch = (block: string) => {
+    const data = block.split("\n").filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart()).join("\n");
+    if (!data) return;
+    const event = JSON.parse(data) as ChatEvent;
+    onEvent(event);
+    if (event.type === "done") completed = true;
+    if (event.type === "error") throw new Error(event.message || "Generation failed.");
   };
-
-  // Cleanup function to close EventSource
-  const cleanupEventSource = () => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // The backend uses JSON SSE messages separated by blank lines.
+      buffer = buffer.replace(/\r\n/g, "\n");
+      let end = buffer.indexOf("\n\n");
+      while (end !== -1) {
+        dispatch(buffer.slice(0, end));
+        buffer = buffer.slice(end + 2);
+        end = buffer.indexOf("\n\n");
+      }
     }
-  };
+    if (buffer.trim()) dispatch(buffer);
+    if (!completed) throw new Error("Connection ended before the reply was saved.");
+  } finally {
+    reader.releaseLock();
+  }
+}
 
-  // Effect to handle cleanup when component unmounts
-  useEffect(() => {
-    return () => {
-      cleanupEventSource();
-    };
+export default function ChatPage() {
+  const [courses, setCourses] = useState<Course[]>([]);
+  const [courseId, setCourseId] = useState("");
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [threadId, setThreadId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [settings, setSettings] = useState<ModelSettings>({ provider: "ollama", model: "qwen3:8b" });
+  const [settingsDraft, setSettingsDraft] = useState<ModelSettings>(settings);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [documentsOpen, setDocumentsOpen] = useState(false);
+  const [courseOpen, setCourseOpen] = useState(false);
+  const [courseName, setCourseName] = useState("");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const abortRef = useRef<AbortController | null>(null);
+  const endRef = useRef<HTMLDivElement | null>(null);
+  const textRef = useRef<HTMLTextAreaElement | null>(null);
+  const currentCourse = courses.find((course) => course.id === courseId);
+  const currentThread = threads.find((thread) => thread.id === threadId);
+
+  const refreshThreads = useCallback(async (id: string) => {
+    const data = await requestJson<Thread[]>(`/threads?course_id=${encodeURIComponent(id)}`);
+    setThreads(data);
+    return data;
   }, []);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  useEffect(() => {
+    let active = true;
+    Promise.all([requestJson<Course[]>("/courses"), requestJson<ModelSettings>("/settings")])
+      .then(([available, selected]) => {
+        if (!active) return;
+        setCourses(available);
+        setSettings(selected);
+        setSettingsDraft(selected);
+        const last = window.localStorage.getItem("questgen:course");
+        setCourseId(available.some((course) => course.id === last) ? last! : available[0]?.id || "");
+      })
+      .catch((cause: Error) => active && setError(cause.message))
+      .finally(() => active && setLoading(false));
+    return () => { active = false; };
+  }, []);
 
-    // Validate inputs
-    if (!questionHeader.trim()) {
-      setError("Question header is required");
-      return;
-    }
+  useEffect(() => {
+    if (!courseId) return;
+    let active = true;
+    window.localStorage.setItem("questgen:course", courseId);
+    setThreads([]);
+    setDocumentsOpen(false);
+    setThreadId(null);
+    setMessages([]);
+    refreshThreads(courseId).then((available) => {
+      if (!active) return;
+      const last = window.localStorage.getItem(`questgen:thread:${courseId}`);
+      if (last && available.some((item) => item.id === last)) {
+        setThreadId(last);
+        requestJson<ChatMessage[]>(`/threads/${last}/messages`)
+          .then((items) => active && setMessages(items))
+          .catch((cause: Error) => active && setError(cause.message));
+      }
+    }).catch((cause: Error) => active && setError(cause.message));
+    return () => { active = false; };
+  }, [courseId, refreshThreads]);
 
-    if (!questionDescription.trim()) {
-      setError("Question description is required");
-      return;
-    }
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: busy ? "instant" : "smooth", block: "end" });
+  }, [messages, busy]);
 
-    if (!apiKey.trim()) {
-      setError("API key is required");
-      return;
-    }
+  useEffect(() => () => abortRef.current?.abort(), []);
 
-    if (files.length === 0) {
-      setError("Please upload at least one file");
-      return;
-    }
-
-    setIsLoading(true);
+  const beginNewChat = () => {
+    if (busy) return;
+    setThreadId(null);
+    setMessages([]);
     setError("");
+    setSidebarOpen(false);
+    if (courseId) window.localStorage.removeItem(`questgen:thread:${courseId}`);
+    textRef.current?.focus();
+  };
 
+  const openThread = async (id: string) => {
+    if (busy || id === threadId) return;
+    setError("");
+    setThreadId(id);
+    setSidebarOpen(false);
+    window.localStorage.setItem(`questgen:thread:${courseId}`, id);
     try {
-      // Create form data for file upload
-      const formData = new FormData();
-      files.forEach((file, index) => {
-        formData.append(`file-${index}`, file);
-      });
-
-      formData.append("questionHeader", questionHeader);
-      formData.append("questionDescription", questionDescription);
-      formData.append("apiKey", apiKey);
-      formData.append("modelName", modelName);
-
-      console.log("Uploading files...");
-
-      // Send data to your API endpoint
-      const response = await fetch("/api/generate-questions", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.message || "Failed to generate questions");
-      }
-
-      const data = await response.json();
-      console.log("Upload response:", data);
-
-      // Store uploaded file names from response
-      if (data.uploadedFiles && data.uploadedFiles.length > 0) {
-        console.log("Files uploaded successfully:", data.uploadedFiles);
-
-        // Set the state and then start fetching via a callback to ensure state is updated
-        setUploadedFileNames(data.uploadedFiles);
-
-        // Use a small timeout to ensure state is updated before proceeding
-        setTimeout(() => {
-          fetchGeneratedQuestions(data.uploadedFiles);
-        }, 50);
-      } else {
-        console.warn("No files were uploaded in the response");
-        setError("No files were processed. Please try again.");
-        setIsLoading(false);
-      }
-    } catch (err: unknown) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Something went wrong. Please try again."
-      );
-      setIsLoading(false);
+      setMessages(await requestJson<ChatMessage[]>(`/threads/${id}/messages`));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not load conversation.");
     }
   };
 
-  // Update fetchGeneratedQuestions to accept direct file list
-  const fetchGeneratedQuestions = (files: string[] = []) => {
-    // Clear previous content and set generating state
-    setGeneratedContent("");
-    setDisplayedContentLength(0);
-    setTypingText("");
-    setIsTypingComplete(false);
-    setIsGenerating(true);
+  const deleteThread = async (id: string) => {
+    if (busy || !window.confirm("Delete this conversation and all of its messages?")) return;
+    try {
+      await requestJson<void>(`/threads/${id}`, { method: "DELETE" });
+      if (threadId === id) beginNewChat();
+      await refreshThreads(courseId);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not delete conversation.");
+    }
+  };
+
+  const addCourse = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!courseName.trim() || busy) return;
+    setSaving(true);
+    try {
+      const created = await requestJson<Course>("/courses", {
+        method: "POST", body: JSON.stringify({ name: courseName.trim() }),
+      });
+      setCourses((previous) => [...previous, created]);
+      setCourseId(created.id);
+      setCourseName("");
+      setCourseOpen(false);
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not create course.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveSettings = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!settingsDraft.model.trim()) return;
+    setSaving(true);
+    try {
+      const updated = await requestJson<ModelSettings>("/settings", {
+        method: "PUT", body: JSON.stringify(settingsDraft),
+      });
+      setSettings(updated);
+      setSettingsOpen(false);
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not save model settings.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const send = async (value = input) => {
+    const content = value.trim();
+    if (!content || !courseId || busy) return;
+    const existingId = threadId;
+    setBusy(true);
     setError("");
-
-    // Clean up any existing EventSource
-    cleanupEventSource();
-
-    // Build URL with query parameters
-    const params = new URLSearchParams();
-    params.set("questionHeader", questionHeader);
-    params.set("questionDescription", questionDescription);
-    params.set("apiKey", apiKey);
-    params.set("modelName", modelName);
-
-    // Use the passed files parameter (from POST response) or fall back to state
-    const filesToUse = files.length > 0 ? files : uploadedFileNames;
-
-    // Add uploaded files to query if available
-    if (filesToUse.length > 0) {
-      console.log("Adding uploaded files to request:", filesToUse);
-      params.set("uploadedFiles", filesToUse.join(","));
-    } else {
-      console.warn("No uploaded files to add to request");
-    }
-
-    const requestUrl = `/api/generate-questions?${params.toString()}`;
-    console.log("Making SSE request to:", requestUrl);
-
-    // Create EventSource for Server-Sent Events
-    const eventSource = new EventSource(requestUrl);
-    eventSourceRef.current = eventSource;
-
-    // Handle incoming messages
-    eventSource.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        console.log("Received data:", data);
-
-        // Only now transition to results view when first real data arrives
-        if (!isFormSubmitted && data.content && data.content.trim() !== "") {
-          setIsAnimating(true);
-
-          // Use timeout to create smooth transition
-          setTimeout(() => {
-            setIsFormSubmitted(true);
-            setIsAnimating(false);
-            setIsLoading(false); // Stop loading state
-
-            // Initial scroll to bottom after view transition
-            setTimeout(() => scrollToBottom(), 100);
-          }, 500);
-        }
-
-        if (data.type === "error") {
-          setError(data.content);
-          setIsGenerating(false);
-          setIsLoading(false);
-          cleanupEventSource();
-          return;
-        }
-
-        // Add new content
-        setGeneratedContent((prev) => {
-          const newContent = prev + (prev ? "\n\n" : "") + data.content;
-
-          // Queue scroll to bottom after content update
-          requestAnimationFrame(() => {
-            if (isGenerating) scrollToBottom();
-          });
-
-          return newContent;
+    setInput("");
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let activeId = existingId;
+    const user: ChatMessage = {
+      id: `pending-user-${Date.now()}`, role: "user", content, created_at: Date.now() / 1000,
+    };
+    const answer: ChatMessage = {
+      id: `pending-answer-${Date.now()}`, role: "assistant", content: "", created_at: Date.now() / 1000,
+    };
+    setMessages((previous) => [...previous, user, answer]);
+    try {
+      if (!activeId) {
+        const created = await requestJson<Thread>("/threads", {
+          method: "POST", body: JSON.stringify({ course_id: courseId }),
         });
-      } catch (e) {
-        console.error("Failed to parse SSE data:", e);
-        // If parsing fails, just add the raw content
-        setGeneratedContent((prev) => prev + (prev ? "\n\n" : "") + event.data);
+        activeId = created.id;
+        setThreadId(created.id);
+        window.localStorage.setItem(`questgen:thread:${courseId}`, created.id);
+        setThreads((previous) => [created, ...previous]);
       }
-    };
-
-    // Handle connection open
-    eventSource.onopen = () => {
-      console.log("EventSource connection established");
-    };
-
-    // Handle errors
-    eventSource.onerror = (error) => {
-      console.error("EventSource error:", error);
-      setError("Error receiving data from the server. Please try again.");
-      setIsGenerating(false);
-      cleanupEventSource();
-    };
-
-    // Handle completion event
-    eventSource.addEventListener("complete", () => {
-      console.log("Generation complete");
-      setIsGenerating(false);
-      cleanupEventSource();
-    });
-  };
-
-  const handleGoBack = () => {
-    cleanupEventSource();
-    setIsAnimating(true);
-    setTimeout(() => {
-      setIsFormSubmitted(false);
-      setIsAnimating(false);
-      setGeneratedContent("");
-      setIsGenerating(false);
-    }, 500);
-  };
-
-  // Effect to animate typing when content is received
-  useEffect(() => {
-    if (!generatedContent || !isFormSubmitted || isGenerating) return;
-
-    // Clear any existing interval
-    if (typingInterval.current) {
-      clearInterval(typingInterval.current);
-    }
-
-    setIsTypingComplete(false);
-
-    // Start the typing animation
-    typingInterval.current = setInterval(() => {
-      setDisplayedContentLength((prev) => {
-        if (prev + typingSpeed >= generatedContent.length) {
-          clearInterval(typingInterval.current!);
-          setIsTypingComplete(true);
-          return generatedContent.length;
+      if (controller.signal.aborted) throw new Error("Response stopped.");
+      const response = await fetch(`${API}/threads/${activeId}/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.detail || `Could not send message (${response.status})`);
+      }
+      await readEvents(response, (event) => {
+        if (event.type === "started" && event.user_id) {
+          setMessages((previous) => previous.map((item) => item.id === user.id ? { ...item, id: event.user_id! } : item));
         }
-        return prev + typingSpeed;
-      });
-    }, 10);
-
-    return () => {
-      if (typingInterval.current) {
-        clearInterval(typingInterval.current);
-      }
-    };
-  }, [generatedContent, isFormSubmitted, isGenerating]);
-
-  // Update typing text when content length changes
-  useEffect(() => {
-    setTypingText(generatedContent.substring(0, displayedContentLength));
-  }, [displayedContentLength, generatedContent]);
-
-  // Function to handle scrolling to bottom with smooth animation
-  const scrollToBottom = () => {
-    if (contentRef.current && !scrolling.current) {
-      scrolling.current = true;
-
-      // Smooth scroll to bottom
-      contentRef.current.scrollTo({
-        top: contentRef.current.scrollHeight,
-        behavior: "smooth",
-      });
-
-      // Reset scrolling flag after animation completes
-      setTimeout(() => {
-        scrolling.current = false;
-
-        // Double check we're at bottom (handles very fast content updates)
-        if (contentRef.current && isGenerating) {
-          const { scrollTop, scrollHeight, clientHeight } = contentRef.current;
-          if (scrollHeight - scrollTop - clientHeight > 50) {
-            contentRef.current.scrollTop = contentRef.current.scrollHeight;
-          }
+        if (event.type === "sources") {
+          setMessages((previous) => previous.map((item) => item.id === answer.id
+            ? { ...item, sources: event.sources || [] } : item));
         }
-      }, 300);
-    }
-  };
-
-  // Enhanced effect to monitor content changes and auto-scroll during generation
-  useEffect(() => {
-    if (isGenerating && contentRef.current) {
-      // Store last scroll position
-      lastScrollPosition.current = contentRef.current.scrollHeight;
-
-      // Use requestAnimationFrame for smoother updates
-      requestAnimationFrame(() => {
-        scrollToBottom();
+        if (event.type === "delta") {
+          setMessages((previous) => previous.map((item) => item.id === answer.id
+            ? { ...item, content: item.content + (event.content || "") } : item));
+        }
+        if (event.type === "done" && event.message_id) {
+          setMessages((previous) => previous.map((item) => item.id === answer.id ? { ...item, id: event.message_id! } : item));
+        }
       });
-    }
-  }, [generatedContent, isGenerating]);
-
-  // Handle auto-scrolling when typing animation advances
-  useEffect(() => {
-    if (isGenerating && contentRef.current && typingText) {
-      // Only auto-scroll if user hasn't manually scrolled up
-      const { scrollTop, scrollHeight, clientHeight } = contentRef.current;
-      const isNearBottom = scrollHeight - scrollTop - clientHeight < 100;
-
-      if (isNearBottom) {
-        requestAnimationFrame(() => {
-          scrollToBottom();
-        });
+    } catch (cause) {
+      setError(controller.signal.aborted ? "Response stopped. Incomplete responses are not saved." :
+        (cause instanceof Error ? cause.message : "Could not generate a response."));
+    } finally {
+      abortRef.current = null;
+      setBusy(false);
+      if (activeId) {
+        try {
+          const [saved] = await Promise.all([
+            requestJson<ChatMessage[]>(`/threads/${activeId}/messages`),
+            refreshThreads(courseId),
+          ]);
+          setMessages(saved);
+        } catch { /* Keep local content and display the preceding error if any. */ }
+      } else {
+        setMessages((previous) => previous.filter((item) => item.id !== answer.id));
       }
+      textRef.current?.focus();
     }
-  }, [typingText, isGenerating]);
-
-  // Check if scroll button should be shown
-  const handleContentScroll = () => {
-    if (!contentRef.current) return;
-
-    const { scrollHeight, clientHeight } = contentRef.current;
-
-    setShowScrollButton(scrollHeight > clientHeight + 20);
   };
 
-  // Add scroll event listener
-  useEffect(() => {
-    const currentRef = contentRef.current;
-    if (currentRef) {
-      currentRef.addEventListener("scroll", handleContentScroll);
-      // Initial check
-      handleContentScroll();
+  const onSubmit = (event: FormEvent) => { event.preventDefault(); void send(); };
+  const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      void send();
     }
-
-    return () => {
-      if (currentRef) {
-        currentRef.removeEventListener("scroll", handleContentScroll);
-      }
-    };
-  }, [isFormSubmitted]);
-
-  // Add an effect to check for scroll button visibility when content changes
-  useEffect(() => {
-    if (contentRef.current) {
-      // Force recalculation of scroll button visibility when content changes
-      setTimeout(handleContentScroll, 100);
-    }
-  }, [generatedContent, typingText]);
-
-  // Render the content with animation
-  const renderAnimatedContent = () => {
-    if (isGenerating) {
-      return (
-        <div
-          ref={contentRef}
-          className="relative overflow-y-scroll overflow-x-hidden overflow-scrollbar-hidden max-h-[75vh] scroll-smooth"
-        >
-          <motion.p
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            className="mb-4"
-          >
-            Generating content based on your uploaded files...
-          </motion.p>
-          {generatedContent && (
-            <motion.div
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.2 }}
-              className="mt-4 border-t border-neutral-700 pt-4"
-            >
-              <p className="text-sm text-green-400 mb-2">
-                Content generated so far:
-              </p>
-              <div className="prose prose-invert max-w-none">
-                <ReactMarkdown>{typingText}</ReactMarkdown>
-                <motion.span
-                  className="inline-block w-1 h-5 bg-blue-400 ml-0.5"
-                  animate={{ opacity: [1, 0, 1] }}
-                  transition={{ repeat: Infinity, duration: 1 }}
-                />
-              </div>
-            </motion.div>
-          )}
-
-          {/* Floating scroll button */}
-          {showScrollButton && (
-            <motion.button
-              initial={{ opacity: 0, scale: 0.8 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.8 }}
-              onClick={scrollToBottom}
-              className="fixed right-4 bottom-4 rounded-full bg-blue-600 hover:bg-blue-500 p-3 shadow-lg transition-colors z-50"
-              aria-label="Scroll to bottom"
-            >
-              <ChevronDown className="h-5 w-5 text-white" />
-            </motion.button>
-          )}
-        </div>
-      );
-    }
-
-    if (!generatedContent) {
-      return (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          className="text-yellow-400"
-        >
-          No content generated yet. There might have been an error.
-          {error && <p className="text-red-400 mt-2">{error}</p>}
-        </motion.div>
-      );
-    }
-
-    return (
-      <motion.div
-        ref={contentRef}
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        className="w-full overflow-y-scroll overflow-x-hidden overflow-scrollbar-hidden max-h-[75vh] relative scroll-smooth"
-        onScroll={handleContentScroll}
-      >
-        <div className="prose prose-invert max-w-none">
-          <ReactMarkdown>{typingText}</ReactMarkdown>
-          {!isTypingComplete && (
-            <motion.span
-              className="inline-block w-1 h-5 bg-blue-400 ml-0.5"
-              animate={{ opacity: [1, 0, 1] }}
-              transition={{ repeat: Infinity, duration: 1 }}
-            />
-          )}
-        </div>
-
-        {/* Floating scroll button */}
-        {showScrollButton && (
-          <motion.button
-            initial={{ opacity: 0, scale: 0.8 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.8 }}
-            onClick={scrollToBottom}
-            className="fixed right-4 bottom-4 rounded-full bg-neutral-600 hover:bg-neutral-400 p-3 shadow-lg transition-colors z-50"
-            aria-label="Scroll to bottom"
-          >
-            <ChevronDown className="h-5 w-5 text-white" />
-          </motion.button>
-        )}
-      </motion.div>
-    );
   };
 
   return (
-    <div className="bg-gradient-to-b from-neutral-950 to-neutral-800 min-h-screen transition-all duration-500">
-      <div className="mx-4 py-6 text-4xl">
-        <Link href="/">
-          <ColourfulText text="QuestGen" />
-        </Link>
-      </div>
+    <div className="qg-app">
+      {sidebarOpen && (
+        <button type="button" aria-label="Close navigation" className="qg-mobile-scrim" onClick={() => setSidebarOpen(false)} />
+      )}
+      <aside className={`qg-sidebar ${sidebarOpen ? "qg-sidebar--open" : ""}`} aria-label="Workspace navigation">
+        <div className="qg-brand">
+          <div className="qg-brand-mark" aria-hidden="true"><PencilLine size={25} strokeWidth={1.8} /></div>
+          <div className="qg-brand-copy"><strong>QuestGen<span className="qg-brand-period">.</span></strong><span>THE ASSESSMENT STUDIO</span></div>
+          <button type="button" aria-label="Close navigation" className="qg-icon-button qg-sidebar-close" onClick={() => setSidebarOpen(false)}><X size={19}/></button>
+        </div>
 
-      <AnimatePresence mode="wait">
-        {!isFormSubmitted ? (
-          <motion.div
-            key="form"
-            initial={{ opacity: 0, y: 20 }}
-            animate={{
-              opacity: isAnimating ? 0 : 1,
-              y: isAnimating ? -20 : 0,
-              scale: isAnimating ? 0.95 : 1,
-            }}
-            exit={{ opacity: 0, y: -20 }}
-            transition={{ duration: 0.4 }}
-            className="w-full"
-          >
-            <form
-              onSubmit={handleSubmit}
-              className="flex flex-col  items-center justify-center gap-2 pt-10 pb-10 px-4"
-            >
-              {error && (
-                <div className="w-full max-w-7xl p-4 bg-red-500/20 border border-red-500 rounded-md text-red-100">
-                  {error}
+        <div className="qg-sidebar-body">
+          <button type="button" className="qg-new-chat" onClick={beginNewChat} disabled={busy}>
+            <span className="qg-new-chat-icon"><Plus size={18} strokeWidth={2}/></span>
+            <span>New conversation</span>
+            <ArrowUpRight size={15} className="qg-new-chat-arrow" />
+          </button>
+
+          <div className="qg-side-section">
+            <div className="qg-section-header">
+              <span className="qg-overline">01 / YOUR COURSE</span>
+              <button type="button" onClick={() => setCourseOpen(true)} className="qg-mini-icon" aria-label="Create course" title="Create course"><Plus size={17}/></button>
+            </div>
+            <div className="qg-select-wrap">
+              <BookOpenText size={17} className="qg-select-leading" aria-hidden="true" />
+              <select aria-label="Selected course" value={courseId} disabled={busy} onChange={(event) => setCourseId(event.target.value)} className="qg-course-select">
+                {courses.map((course) => <option key={course.id} value={course.id}>{course.name}</option>)}
+              </select>
+              <ChevronDown size={16} className="qg-select-trailing" aria-hidden="true" />
+            </div>
+          </div>
+
+          <div className="qg-side-section qg-library-section">
+            <div className="qg-section-header"><span className="qg-overline">02 / LIBRARY</span></div>
+            <button type="button" className="qg-library-link" onClick={() => { setDocumentsOpen(true); setSidebarOpen(false); }} disabled={!courseId}>
+              <Files size={18} strokeWidth={1.8}/><span>Course materials</span><ArrowUpRight size={15} className="qg-link-tail"/>
+            </button>
+            <div className="qg-library-note">Upload lectures, find passages, and cite your sources.</div>
+          </div>
+
+          <div className="qg-side-section qg-history-section">
+            <div className="qg-section-header"><span className="qg-overline">03 / CONVERSATIONS</span><span className="qg-count">{threads.length}</span></div>
+            <nav aria-label="Recent conversations" className="qg-history-list">
+              {threads.length === 0 && <p className="qg-empty-history">Your recent conversations will appear here.</p>}
+              {threads.map((thread) => (
+                <div key={thread.id} className={`qg-history-row ${threadId === thread.id ? "qg-history-row--active" : ""}`}>
+                  <button type="button" className="qg-history-select" onClick={() => void openThread(thread.id)} disabled={busy} title={thread.title}>
+                    <MessageSquareText size={16} strokeWidth={1.65}/><span>{thread.title}</span>
+                  </button>
+                  <button type="button" className="qg-history-delete" onClick={() => void deleteThread(thread.id)} disabled={busy} aria-label={`Delete ${thread.title}`} title="Delete conversation"><Trash2 size={15}/></button>
+                </div>
+              ))}
+            </nav>
+          </div>
+        </div>
+
+        <div className="qg-sidebar-foot">
+          <button type="button" className="qg-settings-link" onClick={() => { setSettingsDraft(settings); setSettingsOpen(true); }}>
+            <span className="qg-settings-icon"><Settings2 size={19}/></span>
+            <span className="qg-settings-copy"><strong>Model settings</strong><small>{settings.provider} · {settings.model}</small></span>
+            <ChevronRight size={17} aria-hidden="true"/>
+          </button>
+          <div className="qg-local-label"><span className="qg-status-dot"/> LOCAL WORKSPACE <span className="qg-local-version">V2.0</span></div>
+        </div>
+      </aside>
+
+      <main className="qg-main">
+        <header className="qg-topbar">
+          <div className="qg-topbar-left">
+            <button type="button" aria-label="Open navigation" className="qg-icon-button qg-menu-button" onClick={() => setSidebarOpen(true)}><Menu size={21}/></button>
+            <span className="qg-breadcrumb-root">Workspace</span><ChevronRight size={14} className="qg-breadcrumb-chevron"/>
+            <span className="qg-breadcrumb-current">{currentCourse?.name || "Choose a course"}</span>
+          </div>
+          <div className="qg-topbar-right">
+            <span className="qg-current-label" title={currentThread?.title || "New conversation"}>{currentThread?.title || "Untitled conversation"}</span>
+            <button type="button" className="qg-topbar-button" onClick={() => setDocumentsOpen(true)} disabled={!courseId}><Files size={17}/><span>Materials</span></button>
+            <button type="button" className="qg-model-badge" onClick={() => { setSettingsDraft(settings); setSettingsOpen(true); }} title="Change model">
+              <span className="qg-model-dot"/><span>{settings.model}</span><ChevronDown size={14}/>
+            </button>
+          </div>
+        </header>
+
+        <div className="qg-paper-workspace">
+          <div className="qg-chat-frame">
+            <section className="qg-chat-scroll" aria-live="polite" aria-label="Conversation">
+              {loading ? (
+                <div className="qg-loading"><Loader2 size={20} className="qg-spin"/><span>Opening your workspace…</span></div>
+              ) : messages.length === 0 ? (
+                <div className="qg-welcome">
+                  <div className="qg-welcome-issue"><span className="qg-issue-line"/> THE PROFESSOR'S WORKSPACE <span className="qg-issue-line"/></div>
+                  <div className="qg-welcome-icon" aria-hidden="true"><PenLine size={27} strokeWidth={1.5}/><span className="qg-icon-spark">✳</span></div>
+                  <h1>Good questions<br/>start <em>here.</em></h1>
+                  <p className="qg-welcome-subtitle">A thoughtful space to plan assessments, explore course material, and refine every question.</p>
+                  <div className="qg-suggestions-title"><span className="qg-overline">A FEW WAYS TO BEGIN</span><span className="qg-title-rule"/></div>
+                  <div className="qg-suggestion-grid">
+                    {SUGGESTIONS.map((suggestion, index) => (
+                      <button type="button" className="qg-suggestion" key={suggestion} disabled={busy || !courseId} onClick={() => void send(suggestion)}>
+                        <span className="qg-suggestion-num">0{index + 1}</span><span className="qg-suggestion-body">{suggestion}</span><ArrowUpRight size={18} className="qg-suggestion-arrow"/>
+                      </button>
+                    ))}
+                  </div>
+                  <button type="button" onClick={() => setDocumentsOpen(true)} className="qg-source-hint" disabled={!courseId}>
+                    <span className="qg-source-hint-icon"><Paperclip size={17}/></span>
+                    <span><strong>Working from your own lectures?</strong> Add course materials for grounded answers.</span>
+                    <ArrowRight size={16}/>
+                  </button>
+                </div>
+              ) : (
+                <div className="qg-messages">
+                  <div className="qg-conversation-meta"><span className="qg-meta-rule"/> <span>CONVERSATION NOTES</span> <span className="qg-meta-rule"/></div>
+                  {messages.map((message) => (
+                    <article key={message.id} className={`qg-message qg-message--${message.role}`}>
+                      {message.role === "assistant" && <div className="qg-assistant-symbol" aria-hidden="true"><PencilLine size={18}/></div>}
+                      <div className="qg-message-content">
+                        <div className="qg-message-label">{message.role === "assistant" ? "QUESTGEN" : "YOU"}</div>
+                        {message.role === "user" ? (
+                          <div className="qg-user-note">{message.content}</div>
+                        ) : (
+                          <div className="qg-assistant-text questgen-prose">
+                            {message.content ? <ReactMarkdown>{message.content}</ReactMarkdown> : <span className="qg-thinking"><Loader2 size={15} className="qg-spin"/> Thinking through your question…</span>}
+                            {!!message.sources?.length && (
+                              <div className="qg-citations">
+                                <div className="qg-citations-title"><BookOpenText size={15}/> REFERENCED MATERIAL</div>
+                                <div className="qg-citation-list">
+                                  {message.sources.map((source, index) => (
+                                    <a key={source.chunk_id} className="qg-citation" href={sourceLink(source)} target="_blank" rel="noopener noreferrer" title={source.snippet.slice(0, 400)}>
+                                      <span>{index + 1}</span> {source.filename}{source.page ? ` · p. ${source.page}` : ""}{source.section ? ` · ${source.section}` : ""}<ArrowUpRight size={13}/>
+                                    </a>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </article>
+                  ))}
+                  <div ref={endRef}/>
                 </div>
               )}
+            </section>
 
-              <div className="w-full  max-w-7xl mx-auto border border-dashed border-neutral-700">
-                <FileUpload onChange={handleFileUpload} />
-                {files.length > 0 && (
-                  <div className="p-4 text-sm text-neutral-300">
-                    {files.length} file(s) selected
-                  </div>
-                )}
-              </div>
-
-              <div className="w-full max-w-7xl">
-                <Label className="text-2xl " htmlFor="questionHeader">
-                  Question Header Section
-                </Label>
-                <div className="grid grid-cols-2 md:grid-cols-3 gap-1 text-xs text-neutral-300 my-1">
-                  <div>- Institution Name</div>
-                  <div>- Exam Type</div>
-                  <div>- Course Name</div>
-                  <div>- Course Code</div>
-                  <div>- Semester</div>
-                  <div>- Duration/Marks</div>
+            <div className="qg-compose-region">
+              {error && <div role="alert" className="qg-error"><AlertCircle size={17}/><span>{error}</span><button type="button" aria-label="Dismiss error" onClick={() => setError("")}><X size={17}/></button></div>}
+              <form className="qg-composer" onSubmit={onSubmit}>
+                <div className="qg-composer-topline"><span>YOUR NEXT THOUGHT</span><span className="qg-compose-line"/></div>
+                <textarea ref={textRef} rows={2} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || !courseId} aria-label="Message QuestGen" placeholder="Ask a question, refine an idea, or plan an assessment…"/>
+                <div className="qg-composer-actions">
+                  <button type="button" onClick={() => setDocumentsOpen(true)} disabled={!courseId} className="qg-attach"><Paperclip size={17}/><span>Attach course material</span></button>
+                  <span className="qg-keyboard-tip">↵ to send · shift ↵ for new line</span>
+                  {busy ? (
+                    <button type="button" onClick={() => abortRef.current?.abort()} className="qg-send" title="Stop response" aria-label="Stop response"><Square size={15} fill="currentColor"/></button>
+                  ) : (
+                    <button type="submit" disabled={!input.trim() || !courseId} className="qg-send" aria-label="Send message"><ArrowUp size={21}/></button>
+                  )}
                 </div>
-                <Input
-                  id="questionHeader"
-                  value={questionHeader}
-                  onChange={(e) => setQuestionHeader(e.target.value)}
-                  placeholder="Enter the Question Header"
-                  className="h-16 mt-2 placeholder:w-[19%] placeholder:text-lg"
-                />
-              </div>
-
-              <div className="w-full max-w-7xl">
-                <Label className="text-2xl" htmlFor="questionDescription">
-                  Question Description
-                </Label>
-                <Input
-                  id="questionDescription"
-                  value={questionDescription}
-                  onChange={(e) => setQuestionDescription(e.target.value)}
-                  placeholder="Enter Brief Description of the Question"
-                  className="h-20 mt-2 placeholder:text-lg"
-                />
-              </div>
-
-              <div className="w-full flex flex-col md:flex-row justify-between items-center max-w-7xl gap-4">
-                <div className="w-full md:w-1/2 flex flex-col md:flex-row gap-4">
-                  <Inputp
-                    id="apiKey"
-                    type="password"
-                    value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    placeholder="Enter API Key"
-                    className="w-full"
-                  />
-
-                  {/* Model Name Input */}
-                  <Inputp
-                    id="modelName"
-                    type="text"
-                    value={modelName}
-                    onChange={(e) => setModelName(e.target.value)}
-                    placeholder="Model Name"
-                    className="w-full"
-                  />
-                </div>
-
-                {!isLoading ? (
-                  <button type="submit" className="w-full md:w-auto">
-                    <InteractiveHoverButton
-                      text="Generate Question Paper"
-                      className="my-8 w-full"
-                    />
-                  </button>
-                ) : (
-                  <motion.div
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    className="w-full md:w-auto p-4 text-center"
-                  >
-                    <div className="flex items-center justify-center space-x-2">
-                      <div
-                        className="w-3 h-3 rounded-full bg-blue-500 animate-bounce"
-                        style={{ animationDelay: "0ms" }}
-                      ></div>
-                      <div
-                        className="w-3 h-3 rounded-full bg-blue-500 animate-bounce"
-                        style={{ animationDelay: "300ms" }}
-                      ></div>
-                      <div
-                        className="w-3 h-3 rounded-full bg-blue-500 animate-bounce"
-                        style={{ animationDelay: "600ms" }}
-                      ></div>
-                    </div>
-                    <p className="text-neutral-300 mt-3">
-                      Generating, please wait...
-                    </p>
-                  </motion.div>
-                )}
-              </div>
-            </form>
-          </motion.div>
-        ) : (
-          <motion.div
-            key="results"
-            initial={{ opacity: 0, y: 20 }}
-            animate={{
-              opacity: isAnimating ? 0 : 1,
-              y: isAnimating ? 20 : 0,
-            }}
-            exit={{ opacity: 0, y: 20 }}
-            transition={{ duration: 0.4 }}
-            className="w-full"
-          >
-            <div className="flex justify-center gap-10 min-h-[78vh] h-auto">
-              <div className="w-fit mt-10 pl-5">
-                <div onClick={handleGoBack} className="cursor-pointer">
-                  <ArrowButton />
-                </div>
-              </div>
-              <div className="grid h-full w-[80%]">
-                <MainMenusGradientCard
-                  className="p-4 text-xl backdrop-blur-sm"
-                  description={`Based on:\n${questionHeader}\n\n${questionDescription}`}
-                  title={
-                    isGenerating
-                      ? "Generating Your Question Paper..."
-                      : "Generated Question Paper"
-                  }
-                >
-                  {renderAnimatedContent()}
-                </MainMenusGradientCard>
-              </div>
+              </form>
+              <div className="qg-compose-footer"><span>QUESTGEN · COURSE-BASED ASSISTANCE</span><span>Review AI-generated content before use</span></div>
             </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+          </div>
+        </div>
+        {documentsOpen && courseId && <DocumentPanel courseId={courseId} onClose={() => setDocumentsOpen(false)}/>}
+      </main>
+
+      {(settingsOpen || courseOpen) && (
+        <div className="qg-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) { setSettingsOpen(false); setCourseOpen(false); } }}>
+          <div role="dialog" aria-modal="true" aria-label={settingsOpen ? "Model settings" : "New course"} className="qg-dialog">
+            <div className="qg-dialog-head"><div><span className="qg-overline">WORKSPACE PREFERENCES</span><h2>{settingsOpen ? "Model settings" : "New course"}</h2></div><button type="button" className="qg-icon-button" aria-label="Close dialog" onClick={() => { setSettingsOpen(false); setCourseOpen(false); }}><X size={19}/></button></div>
+            {settingsOpen ? (
+              <form onSubmit={saveSettings} className="qg-dialog-form">
+                <label htmlFor="provider">AI provider</label>
+                <select id="provider" value={settingsDraft.provider} onChange={(event) => {
+                  const provider = event.target.value as ModelSettings["provider"];
+                  setSettingsDraft({ provider, model: provider === "ollama" ? "qwen3:8b" : provider === "openrouter" ? "openai/gpt-4o-mini" : "gpt-4o-mini" });
+                }}><option value="ollama">Ollama (local)</option><option value="openrouter">OpenRouter</option><option value="openai">OpenAI</option></select>
+                <label htmlFor="model">Model identifier</label>
+                <input id="model" required maxLength={120} value={settingsDraft.model} onChange={(event) => setSettingsDraft((previous) => ({ ...previous, model: event.target.value }))} placeholder="e.g. qwen3:8b"/>
+                <p className="qg-form-help">API keys are configured on the backend, not stored in the browser. For Ollama, make sure the local server is running.</p>
+                <button type="submit" className="qg-primary-submit" disabled={saving || busy || !settingsDraft.model.trim()}>{saving ? "Saving…" : "Save model settings"} <ArrowRight size={17}/></button>
+              </form>
+            ) : (
+              <form onSubmit={addCourse} className="qg-dialog-form">
+                <label htmlFor="course-name">Course name</label>
+                <input id="course-name" autoFocus required maxLength={80} value={courseName} onChange={(event) => setCourseName(event.target.value)} placeholder="e.g. Data Structures"/>
+                <button type="submit" className="qg-primary-submit" disabled={saving || !courseName.trim()}>{saving ? "Creating…" : "Create course"} <ArrowRight size={17}/></button>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
-
-export default Page;
