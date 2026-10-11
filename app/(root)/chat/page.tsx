@@ -13,6 +13,9 @@ import {
   PenLine,
   PencilLine,
   Loader2,
+  ClipboardList,
+  RotateCcw,
+  CheckCircle2,
   Menu,
   MessageSquareText,
   Plus,
@@ -24,6 +27,7 @@ import {
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { DocumentPanel, Source, sourceLink } from "@/components/workspace/DocumentPanel";
+import QuestionEditor, { type AssessmentQuestion } from "@/components/workspace/QuestionEditor";
 
 type Course = { id: string; name: string; created_at: number };
 type Thread = { id: string; course_id: string; title: string; updated_at: number };
@@ -33,6 +37,17 @@ type ChatMessage = {
   content: string;
   created_at: number;
   sources?: Source[];
+};
+type AssessmentActivity = { id: number; stage: string; message: string; progress: number };
+type AssessmentJob = {
+  id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  stage: string;
+  prompt: string;
+  blueprint: null | { title: string; instructions: string; total_marks: number; questions: unknown[] };
+  questions: AssessmentQuestion[];
+  events: AssessmentActivity[];
+  error: string | null;
 };
 type ModelSettings = {
   provider: "ollama" | "openrouter" | "openai";
@@ -112,6 +127,11 @@ export default function ChatPage() {
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [assessment, setAssessment] = useState<AssessmentJob | null>(null);
+  const [activities, setActivities] = useState<AssessmentActivity[]>([]);
+  const [startingExam, setStartingExam] = useState(false);
+  const [showAnswers, setShowAnswers] = useState(false);
+  const [editingQuestionId, setEditingQuestionId] = useState<string | null>(null);
   const [settings, setSettings] = useState<ModelSettings>({ provider: "ollama", model: "qwen3:8b" });
   const [settingsDraft, setSettingsDraft] = useState<ModelSettings>(settings);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -125,7 +145,7 @@ export default function ChatPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const abortRef = useRef<AbortController | null>(null);
-  const endRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useRef<HTMLElement | null>(null);
   const textRef = useRef<HTMLTextAreaElement | null>(null);
   const currentCourse = courses.find((course) => course.id === courseId);
   const currentThread = threads.find((thread) => thread.id === threadId);
@@ -160,6 +180,8 @@ export default function ChatPage() {
     setDocumentsOpen(false);
     setThreadId(null);
     setMessages([]);
+    setAssessment(null);
+    setActivities([]);
     refreshThreads(courseId).then((available) => {
       if (!active) return;
       const last = window.localStorage.getItem(`questgen:thread:${courseId}`);
@@ -173,8 +195,53 @@ export default function ChatPage() {
     return () => { active = false; };
   }, [courseId, refreshThreads]);
 
+  const refreshAssessment = useCallback(async (id: string) => {
+    const jobs = await requestJson<AssessmentJob[]>(`/threads/${id}/generations`);
+    setAssessment(jobs[0] || null);
+    setActivities(jobs[0]?.events || []);
+  }, []);
+
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: busy ? "instant" : "smooth", block: "end" });
+    if (!threadId) { setAssessment(null); setActivities([]); return; }
+    let active = true;
+    requestJson<AssessmentJob[]>(`/threads/${threadId}/generations`).then((jobs) => {
+      if (!active) return;
+      setAssessment(jobs[0] || null);
+      setActivities(jobs[0]?.events || []);
+    }).catch((cause: Error) => { if (active) setError(cause.message); });
+    return () => { active = false; };
+  }, [threadId]);
+
+  useEffect(() => {
+    if (!threadId || !assessment || (assessment.status !== "queued" && assessment.status !== "running")) return;
+    const currentJob = assessment.id;
+    const source = new EventSource(`${API}/threads/${threadId}/generations/${currentJob}/events`);
+    const update = async () => {
+      try {
+        const job = await requestJson<AssessmentJob>(`/threads/${threadId}/generations/${currentJob}`);
+        setAssessment((old) => old?.id === currentJob ? job : old);
+        setActivities(job.events || []);
+      } catch { /* Reconnect via the persisted SSE event stream. */ }
+    };
+    source.onmessage = (event) => {
+      try {
+        const info = JSON.parse(event.data) as AssessmentActivity & { type: string };
+        if (info.type === "activity") {
+          setActivities((old) => old.some((item) => item.id === info.id) ? old : [...old, info].slice(-35));
+          if (["saved", "completed", "failed", "blueprint"].includes(info.stage)) void update();
+        }
+        if (info.type === "complete") { source.close(); void update(); }
+      } catch { /* Ignore malformed partial events; a refresh reloads saved state. */ }
+    };
+    return () => source.close();
+  }, [threadId, assessment?.id, assessment?.status]);
+
+  useEffect(() => {
+    // Only scroll the conversation viewport, never the document or outer workspace.
+    if (messages.length) {
+      const viewport = scrollRef.current;
+      viewport?.scrollTo({ top: viewport.scrollHeight, behavior: busy ? "instant" : "smooth" });
+    }
   }, [messages, busy]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
@@ -183,6 +250,8 @@ export default function ChatPage() {
     if (busy) return;
     setThreadId(null);
     setMessages([]);
+    setAssessment(null);
+    setActivities([]);
     setError("");
     setSidebarOpen(false);
     if (courseId) window.localStorage.removeItem(`questgen:thread:${courseId}`);
@@ -193,6 +262,8 @@ export default function ChatPage() {
     if (busy || id === threadId) return;
     setError("");
     setThreadId(id);
+    setAssessment(null);
+    setActivities([]);
     setSidebarOpen(false);
     window.localStorage.setItem(`questgen:thread:${courseId}`, id);
     try {
@@ -326,6 +397,106 @@ export default function ChatPage() {
     }
   };
 
+  const startAssessment = async () => {
+    const prompt = input.trim();
+    if (!prompt || !courseId || busy || startingExam || assessment?.status === "running" || assessment?.status === "queued") return;
+    setStartingExam(true);
+    setError("");
+    try {
+      let target = threadId;
+      if (!target) {
+        const created = await requestJson<Thread>("/threads", {
+          method: "POST", body: JSON.stringify({ course_id: courseId }),
+        });
+        target = created.id;
+        setThreadId(target);
+        setThreads((items) => [created, ...items]);
+        window.localStorage.setItem(`questgen:thread:${courseId}`, target);
+      }
+      const job = await requestJson<AssessmentJob>(`/threads/${target}/generations`, {
+        method: "POST", body: JSON.stringify({ prompt }),
+      });
+      setAssessment(job);
+      setActivities(job.events || []);
+      setInput("");
+      setShowAnswers(false);
+      await refreshThreads(courseId);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not start assessment.");
+    } finally {
+      setStartingExam(false);
+    }
+  };
+
+  const questionAction = async (id: string, path: string, method: "PUT" | "POST", body: object) => {
+    if (!assessment || !threadId || assessment.status !== "completed") return;
+    setEditingQuestionId(id);
+    setError("");
+    try {
+      const base = `/threads/${threadId}/generations/${assessment.id}`;
+      await requestJson(`${base}/questions/${id}${path ? `/${path}` : ""}`, {
+        method, body: JSON.stringify(body),
+      });
+      const updated = await requestJson<AssessmentJob>(base);
+      setAssessment(updated);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not update question.");
+      throw cause;
+    } finally { setEditingQuestionId(null); }
+  };
+
+  const questionHistory = async (id: string) => {
+    if (!assessment || !threadId) throw new Error("No active assessment");
+    return requestJson<{versions: {version:number;content: AssessmentQuestion["content"];change_type:string;instruction:string;created_at:number}[]}>(
+      `/threads/${threadId}/generations/${assessment.id}/questions/${id}/versions`);
+  };
+
+  const customizeAssessment = async () => {
+    if (!assessment || !threadId || assessment.status !== "completed" || !input.trim() || busy || startingExam) return;
+    setStartingExam(true);
+    setError("");
+    try {
+      await requestJson(`/threads/${threadId}/generations/${assessment.id}/customize`, {
+        method: "POST", body: JSON.stringify({ instruction: input.trim() }),
+      });
+      setInput("");
+      await Promise.all([refreshAssessment(threadId), requestJson<ChatMessage[]>(`/threads/${threadId}/messages`).then(setMessages)]);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not apply requested changes."); }
+    finally { setStartingExam(false); }
+  };
+
+  const downloadExam = async (audience: "student" | "instructor", format: "pdf" | "docx") => {
+    if (!assessment || !threadId) return;
+    try {
+      const url = `${API}/threads/${threadId}/generations/${assessment.id}/export/${audience}.${format}`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || `Export failed (${response.status})`);
+      }
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = `questgen-${audience}-${assessment.id.slice(0,8)}.${format}`;
+      document.body.appendChild(anchor); anchor.click(); anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not export assessment."); }
+  };
+
+  const retryAssessment = async () => {
+    if (!assessment || !threadId || assessment.status !== "failed") return;
+    setStartingExam(true);
+    try {
+      const job = await requestJson<AssessmentJob>(`/threads/${threadId}/generations/${assessment.id}/retry`, { method: "POST" });
+      setAssessment(job);
+      setActivities(job.events || []);
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not retry assessment.");
+    } finally { setStartingExam(false); }
+  };
+
   const onSubmit = (event: FormEvent) => { event.preventDefault(); void send(); };
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -418,8 +589,8 @@ export default function ChatPage() {
         </header>
 
         <div className="qg-paper-workspace">
-          <div className="qg-chat-frame">
-            <section className="qg-chat-scroll" aria-live="polite" aria-label="Conversation">
+          <section ref={scrollRef} className={`qg-chat-scroll ${!loading && messages.length === 0 && !assessment ? "qg-chat-scroll--welcome" : ""}`} aria-live="polite" aria-label="Conversation">
+            <div className="qg-chat-frame">
               {loading ? (
                 <div className="qg-loading"><Loader2 size={20} className="qg-spin"/><span>Opening your workspace…</span></div>
               ) : messages.length === 0 ? (
@@ -472,19 +643,68 @@ export default function ChatPage() {
                       </div>
                     </article>
                   ))}
-                  <div ref={endRef}/>
                 </div>
               )}
-            </section>
+              {assessment && (
+                <section className="qg-assessment" aria-label="Assessment draft">
+                  <div className="qg-assessment-head">
+                    <span className="qg-overline">ASSESSMENT WORKFLOW</span>
+                    <span className={`qg-assessment-status qg-assessment-status--${assessment.status}`}>
+                      {assessment.status === "completed" ? <CheckCircle2 size={14}/> : <Loader2 size={14} className={assessment.status === "running" ? "qg-spin" : ""}/>}
+                      {assessment.status.toUpperCase()}
+                    </span>
+                  </div>
+                  <h2>{assessment.blueprint?.title || "Preparing assessment blueprint"}</h2>
+                  <p className="qg-assessment-prompt">{assessment.prompt}</p>
+                  {assessment.blueprint && <div className="qg-assessment-meta">
+                    <span>{assessment.blueprint.questions.length} questions</span>
+                    <span>{assessment.blueprint.total_marks} marks</span>
+                    <span>{assessment.questions.length} saved</span>
+                  </div>}
+                  <div className="qg-assessment-progress"><div style={{ width: `${activities.at(-1)?.progress ?? (assessment.status === "completed" ? 100 : 0)}%` }}/></div>
+                  <div className="qg-assessment-log" aria-live="polite">
+                    {activities.slice(-5).map((item) => <div key={item.id}><span className="qg-assessment-log-stage">{item.stage}</span>{item.message}</div>)}
+                  </div>
+                  {assessment.error && <div role="alert" className="qg-assessment-error">{assessment.error} <button type="button" onClick={() => void retryAssessment()} disabled={startingExam}><RotateCcw size={15}/> Retry saved draft</button></div>}
+                  {assessment.questions.map((question) => (
+                    <QuestionEditor key={`${question.id}-${question.version}-${question.locked}-${question.review_status}`}
+                      question={question} showAnswers={showAnswers}
+                      disabled={assessment.status !== "completed" || editingQuestionId !== null || startingExam}
+                      onChange={questionAction} fetchHistory={questionHistory}/>
+                  ))}
+                  {assessment.questions.length > 0 && <button className="qg-assessment-toggle" type="button" onClick={() => setShowAnswers((old) => !old)}>{showAnswers ? "Hide" : "Show"} answer key</button>}
+                  {assessment.status === "completed" && <div className="qg-export-panel">
+                    <span className="qg-overline">EXPORT YOUR ASSESSMENT</span>
+                    <p>{assessment.questions.filter(q => q.review_status === "approved").length}/{assessment.questions.length} questions approved. Student exports require all approvals.</p>
+                    <div className="qg-question-actions">
+                      <button type="button" onClick={() => void downloadExam("instructor", "pdf")}>Instructor PDF</button>
+                      <button type="button" onClick={() => void downloadExam("instructor", "docx")}>Instructor DOCX</button>
+                      <button type="button" disabled={!assessment.questions.length || !assessment.questions.every(q => q.review_status === "approved")} onClick={() => void downloadExam("student", "pdf")}>Student PDF</button>
+                      <button type="button" disabled={!assessment.questions.length || !assessment.questions.every(q => q.review_status === "approved")} onClick={() => void downloadExam("student", "docx")}>Student DOCX</button>
+                    </div>
+                  </div>}
+                  <p className="qg-assessment-disclaimer">Question edits are versioned; regeneration never changes locked questions. Review the final exam before use.</p>
+                </section>
+              )}
+            </div>
+          </section>
 
-            <div className="qg-compose-region">
+          <div className="qg-compose-region">
+            <div className="qg-compose-inner">
               {error && <div role="alert" className="qg-error"><AlertCircle size={17}/><span>{error}</span><button type="button" aria-label="Dismiss error" onClick={() => setError("")}><X size={17}/></button></div>}
               <form className="qg-composer" onSubmit={onSubmit}>
                 <div className="qg-composer-topline"><span>YOUR NEXT THOUGHT</span><span className="qg-compose-line"/></div>
-                <textarea ref={textRef} rows={2} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || !courseId} aria-label="Message QuestGen" placeholder="Ask a question, refine an idea, or plan an assessment…"/>
+                <textarea ref={textRef} rows={2} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || !courseId} aria-label="Message QuestGen" placeholder={assessment?.status === "completed" ? "e.g. Make question 2 harder, or lock question 1…" : "Ask a question, refine an idea, or plan an assessment…"}/>
                 <div className="qg-composer-actions">
                   <button type="button" onClick={() => setDocumentsOpen(true)} disabled={!courseId} className="qg-attach"><Paperclip size={17}/><span>Attach course material</span></button>
                   <span className="qg-keyboard-tip">↵ to send · shift ↵ for new line</span>
+                  {assessment?.status === "completed" && <button type="button" className="qg-assessment-action" onClick={() => void customizeAssessment()}
+                    disabled={!input.trim() || busy || startingExam || editingQuestionId !== null} title="Apply conversational edits to question(s) in this assessment">
+                    <PencilLine size={15}/> Apply to draft
+                  </button>}
+                  <button type="button" className="qg-assessment-action" onClick={() => void startAssessment()} disabled={!input.trim() || !courseId || busy || startingExam || assessment?.status === "running" || assessment?.status === "queued"} title="Generate a structured assessment from these instructions">
+                    {startingExam ? <Loader2 size={15} className="qg-spin"/> : <ClipboardList size={16}/>} Generate exam
+                  </button>
                   {busy ? (
                     <button type="button" onClick={() => abortRef.current?.abort()} className="qg-send" title="Stop response" aria-label="Stop response"><Square size={15} fill="currentColor"/></button>
                   ) : (
