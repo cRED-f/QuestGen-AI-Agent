@@ -44,3 +44,34 @@ test('unrelated text containing pipes is not rendered as a table', () => {
   assert.equal(result.length, 1);
   assert.equal(result[0].kind, 'markdown');
 });
+
+test('flattened Tina and David question reconstructs its six-row table and preserves the marks', () => {
+  const text = 'Tina and David produce coconuts and pineapples. Which producer has comparative advantage? | Producer | Coconuts | Pineapples | |---|---|---| | Tina | 100 | 0 | | Tina | 50 | 25 | | Tina | 0 | 50 | | David | 50 | 0 | | David | 25 | 40 | | David | 0 | 80 | **(5)**';
+  const result = parse(text);
+  assert.equal(result.length, 3);
+  assert.match(result[0].value, /Which producer/);
+  assert.equal(result[0].value.includes('|---|'), false);
+  const table = result[1];
+  assert.equal(table.kind, 'table');
+  assert.deepEqual(Array.from(table.headings), ['Producer', 'Coconuts', 'Pineapples']);
+  assert.deepEqual(Array.from(table.rows, row => Array.from(row)), [
+    ['Tina','100','0'], ['Tina','50','25'], ['Tina','0','50'],
+    ['David','50','0'], ['David','25','40'], ['David','0','80'],
+  ]);
+  assert.match(result[2].value, /\*\*\(5\)\*\*/);
+});
+
+test('ordinary prose and fenced code with flattened-looking table are left untouched', () => {
+  const flattened = 'Example | A | B | |---|---| | one | two |';
+  assert.equal(parse(`\`\`\`md\n${flattened}\n\`\`\``).length, 1);
+  const prose = 'The author says A | B, with no table separator.';
+  assert.equal(parse(prose).length, 1);
+  assert.equal(parse(prose)[0].value, prose);
+});
+
+test('formatted question stems are used in every exam surface', () => {
+  for (const file of ['ExamPaperBuilder.tsx', 'ExamPaperSidebar.tsx', 'QuestionEditor.tsx']) {
+    const contents = fs.readFileSync(path.join(__dirname, `../components/workspace/${file}`), 'utf8');
+    assert.match(contents, /<FormattedMessage content=\{(?:candidate\.stem|question\.content\.stem|q\.content\.stem)\}/);
+  }
+});

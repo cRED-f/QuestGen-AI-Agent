@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import FormattedMessage from "@/components/workspace/FormattedMessage";
 import { Check, ClipboardCheck, History, LockKeyhole, LockKeyholeOpen, PencilLine, RefreshCw, X } from "lucide-react";
 import { type Source, sourceLink, sourceLocation } from "@/components/workspace/DocumentPanel";
 
@@ -67,7 +68,7 @@ export default function QuestionEditor({ question: q, showAnswers, disabled, onC
       <span>Q{q.ordinal} · {q.content.kind.replaceAll("_", " ")} · {q.content.marks} marks</span>
       <span>v{q.version} · {q.content.bloom_level} · {q.review_status}{q.locked ? " · locked" : ""}</span>
     </div>
-    <p>{q.content.stem}</p>
+    <div className="qg-question-rich questgen-prose"><FormattedMessage content={q.content.stem}/></div>
     {!!q.content.options.length && <ol type="A">{q.content.options.map((option, i) => <li key={i}>{option}</li>)}</ol>}
     {showAnswers && <div className="qg-assessment-answer"><strong>Answer:</strong> {q.content.correct_answer}<p>{q.content.explanation}</p></div>}
     <div className="qg-assessment-citations">
@@ -107,7 +108,7 @@ export default function QuestionEditor({ question: q, showAnswers, disabled, onC
     </div>
     {historyOpen && <div className="qg-question-history"><strong>Revision history (newest first)</strong>
       {(history?.versions || []).map(v => <details key={v.version}><summary>Version {v.version} · {v.change_type} · {new Date(v.created_at * 1000).toLocaleString()}</summary>
-        <p>{v.content.stem}</p><small>{v.instruction}</small>
+        <div className="qg-question-rich questgen-prose"><FormattedMessage content={v.content.stem}/></div><small>{v.instruction}</small>
         {v.version !== q.version && !q.locked && <div className="qg-question-actions"><button type="button" disabled={busy} onClick={() => void update("restore", "POST", {target_version: v.version})}>Restore as new version</button></div>}
       </details>)}
       {!history?.versions.length && <p>No version snapshots available yet.</p>}

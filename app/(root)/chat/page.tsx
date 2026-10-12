@@ -107,6 +107,14 @@ type ChatEvent = {
   message?: string;
 };
 
+type ExamGenerationStatus = {
+  request_id?: string;
+  id?: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  error?: string | null;
+  paper?: ExamPaper | null;
+};
+
 const API = "/api/workspace";
 // This is a per-conversation acknowledgement, never a global onboarding gate.
 const examIntroKey = (id: string) => `questgen:exam-intro:${id}`;
@@ -140,7 +148,7 @@ async function requestJson<T>(path: string, options?: RequestInit): Promise<T> {
     const message = typeof result.detail === "string" ? result.detail : "";
     const endpoint = path.split("?")[0].replace(/\/threads\/[^/]+/, "/threads/…");
     throw new Error(message || (response.status >= 500
-      ? `Backend error (${response.status}) while loading ${endpoint}. Check the FastAPI terminal for the traceback.`
+      ? `QuestGen returned HTTP ${response.status} without a readable API error for ${endpoint}. Check both the Next.js and FastAPI terminals, and confirm QUESTGEN_API_ORIGIN points to the running backend (default: http://127.0.0.1:8000).`
       : `Request failed (${response.status}) at ${endpoint}`));
   }
   return response.status === 204 ? (undefined as T) : ((await response.json()) as T);
@@ -643,6 +651,29 @@ export default function ChatPage() {
     return () => { active = false; };
   }, [threadId, workspaceMode]);
 
+  // If the page reloads during a slow generation, reconnect to its durable
+  // status instead of leaving the panel indefinitely in "generating".
+  useEffect(() => {
+    if (!threadId || workspaceMode !== "exam" || examPaper?.status !== "generating" || paperBusy) return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const state = await requestJson<ExamGenerationStatus | null>(
+          `/threads/${threadId}/exam/paper/generation/latest`,
+        );
+        if (!active) return;
+        if (state?.paper) setExamPaper(state.paper);
+        if (state?.status === "failed") setError(state.error || "Question generation failed.");
+        if (!state) await refreshExamPaper(threadId);
+      } catch {
+        if (active) await refreshExamPaper(threadId).catch(() => {});
+      }
+    };
+    void poll();
+    const timer = setInterval(() => { void poll(); }, 1500);
+    return () => { active = false; clearInterval(timer); };
+  }, [threadId, workspaceMode, examPaper?.status, paperBusy, refreshExamPaper]);
+
   const paperAction = async (path: string, method: string = "POST", body?: unknown) => {
     if (!threadId || paperBusy || examBusy) return;
     setPaperBusy(true);
@@ -654,11 +685,38 @@ export default function ChatPage() {
       setExamPaper(old => old ? {...old, status: "generating"} : old);
     }
     try {
-      const paper = await requestJson<ExamPaper>(`/threads/${threadId}/exam/paper${path}`, {
-        method, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        ...(abort ? {signal: abort.signal} : {}),
-      });
-      setExamPaper(paper);
+      if (generating) {
+        // Model calls can take minutes. Start the job with a quick 202 response,
+        // then poll a short GET request instead of holding a rewrite open.
+        const start = await requestJson<ExamGenerationStatus>(
+          `/threads/${threadId}/exam/paper/generation/start`, {
+            method: "POST",
+            body: JSON.stringify({regenerate: path === "/regenerate", ...(body && typeof body === "object" ? body : {})}),
+            signal: abort?.signal,
+          },
+        );
+        if (!start.request_id) throw new Error("QuestGen did not return a generation request ID.");
+        while (!abort?.signal.aborted) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          if (abort?.signal.aborted) break;
+          const status = await requestJson<ExamGenerationStatus>(
+            `/threads/${threadId}/exam/paper/generation/${start.request_id}`,
+            {signal: abort?.signal},
+          );
+          if (abort?.signal.aborted) break;
+          if (status.paper) setExamPaper(status.paper);
+          if (status.status === "succeeded") break;
+          if (status.status === "cancelled") break;
+          if (status.status === "failed") {
+            throw new Error(status.error || "Question generation failed. Check the FastAPI terminal.");
+          }
+        }
+      } else {
+        const paper = await requestJson<ExamPaper>(`/threads/${threadId}/exam/paper${path}`, {
+          method, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
+        setExamPaper(paper);
+      }
     } catch (cause) {
       if (!(abort?.signal.aborted)) setError(cause instanceof Error ? cause.message : "Could not update exam paper.");
       // A timed-out request may have completed server-side; read the authoritative state.
@@ -1481,7 +1539,7 @@ export default function ChatPage() {
               )}
             </div>
           </section>
-          {showScrollDown && <button type="button" className="qg-scroll-latest" onClick={() => scrollToLatest(true)} aria-label="Scroll to latest message" title="Jump to latest message"><ArrowDown size={18}/><span>Latest</span></button>}
+          {showScrollDown && <button type="button" className="qg-scroll-latest" onClick={() => scrollToLatest(true)} aria-label="Scroll to latest message" title="Jump to latest message"><ArrowDown size={19} aria-hidden="true"/></button>}
 
           <div className="qg-compose-region">
             <div className="qg-compose-inner">

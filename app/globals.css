@@ -204,6 +204,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .questgen-prose table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
 .questgen-prose th, .questgen-prose td { border: 1px solid #d5d9ce; padding: .35em .6em; text-align: left; }
 .questgen-prose strong { color: #2c392d; font-weight: 700; }
+/* Generated exam stems can contain multi-line or model-flattened Markdown tables. */
+.qg-question-rich { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.qg-question-rich > p { margin: 0 0 .55em; line-height: 1.6; }
+.qg-question-rich > p:last-child { margin-bottom: 0; }
+.qg-candidate .qg-question-rich { font-size: 15px; font-weight: 550; color: inherit; }
+.qg-candidate .qg-question-rich .qg-table-scroll { font-weight: 400; }
+.qg-assessment-question .qg-question-rich { margin: 10px 0; font-size: 14px; color: #2d382d; }
+.qg-sheet-question-stem { display: block; line-height: 1.6; }
+.qg-sheet-question-stem > strong { display: inline-block; margin-right: 6px; }
+.qg-sheet-question-stem > b { display: block; margin: 5px 0 0; }
+.qg-sheet-question-stem .qg-question-rich { margin-top: 4px; font-size: 12px; }
+.qg-sheet-question-stem .qg-table-scroll table { font-size: 11.5px; }
+.qg-app[data-theme="dark"] .qg-paper-sheet .qg-question-rich,
+.qg-app[data-theme="dark"] .qg-paper-sheet .qg-question-rich strong { color: #28382e; }
+
 /* Slide-out source shelf */
 .qg-document-scrim { position: absolute; inset: 0; z-index: 9; border: none; background: #373d3340; }
 .qg-document-panel { position: absolute; z-index: 10; right: 0; top: 0; bottom: 0; width: min(460px,100%); display: flex; flex-direction: column; border-left: 1px solid #d3d2c5; background: #fbfaf6; box-shadow: -15px 0 40px #454a3724; }
@@ -1203,13 +1218,15 @@ html[data-theme="dark"] .qg-exam-choice-option > svg { color: #c8d8c2; }
 /* Conversation activity: quiet, user-controlled and not a raw reasoning trace. */
 .qg-chat-column { position: relative; }
 .qg-scroll-latest {
-  position: absolute; z-index: 9; right: 24px; bottom: clamp(190px, 27vh, 300px);
-  display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--qg-border-dark);
-  border-radius: 999px; background: var(--qg-sidebar); color: var(--qg-ink);
-  box-shadow: 0 6px 24px #26352a27; padding: 9px 13px; font-size: 12px; font-weight: 650;
+  position: absolute; z-index: 9; left: 50%; bottom: clamp(190px, 27vh, 300px);
+  transform: translateX(-50%);
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 42px; height: 42px; border: 1px solid var(--qg-border-dark);
+  border-radius: 50%; background: var(--qg-sidebar); color: var(--qg-ink);
+  box-shadow: 0 6px 24px #26352a27; padding: 0;
   transition: transform .18s ease, box-shadow .18s ease;
 }
-.qg-scroll-latest:hover { transform: translateY(-2px); box-shadow: 0 8px 22px #26352a34; }
+.qg-scroll-latest:hover { transform: translate(-50%, -2px); box-shadow: 0 8px 22px #26352a34; }
 .qg-scroll-latest:focus-visible, .qg-ai-activity-toggle:focus-visible { outline: 2px solid var(--qg-sage); outline-offset: 3px; }
 .qg-ai-activity { margin: 2px 0 12px; padding: 7px 10px; border: 1px solid var(--qg-border); border-radius: 10px; background: var(--qg-sidebar); color: var(--qg-muted); max-width: 480px; }
 .qg-ai-activity-toggle { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; width: 100%; font-size: 11px; font-weight: 650; color: var(--qg-ink); text-align: left; }
@@ -1265,5 +1282,5 @@ html[data-theme="dark"] .qg-exam-choice-option > svg { color: #c8d8c2; }
 .qg-app[data-theme="dark"] .qg-paper-sheet { background: #eeeae0; color: #28382e; }
 .qg-app[data-theme="dark"] .qg-paper-sheet :is(h3,h4,p,li,.qg-sheet-university) { color: #28382e; }
 @media (prefers-reduced-motion: reduce) { .qg-scroll-latest, .qg-paper-meter span { transition: none !important; } }
-@media(max-width:850px) { .qg-scroll-latest { right: 14px; bottom: 215px; } }
+@media(max-width:850px) { .qg-scroll-latest { bottom: 215px; } }
 .qg-error-retry { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; white-space: nowrap; font-size: 11px; font-weight: 700; border: 1px solid currentColor; border-radius: 7px; padding: 5px 8px; }

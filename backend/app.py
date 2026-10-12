@@ -198,6 +198,7 @@ async def lifespan(_app: FastAPI):
     _app.state.document_queue = queue
     generation_queue: asyncio.Queue[str] = asyncio.Queue()
     _app.state.generation_queue = generation_queue
+    _app.state.exam_generation_tasks = {}
     with database() as conn:
         pending = [row["id"] for row in conn.execute(
             "SELECT id FROM documents WHERE status IN ('queued','extracting','chunking','indexing')"
@@ -222,6 +223,11 @@ async def lifespan(_app: FastAPI):
         for job_id in recovered:
             conn.execute("UPDATE assessment_jobs SET status='queued' WHERE id=?", (job_id,))
             generation.emit(conn, job_id, "recovered", "Recovered unfinished assessment", 0)
+        # Exam-mode requests use short HTTP calls and a tracked background task.
+        # A restarted process cannot resume its in-flight model call.
+        conn.execute("UPDATE exam_paper_generation_requests SET status='failed',"
+                     "error='Backend restarted during question generation. Please retry.',updated_at=? "
+                     "WHERE status IN ('queued','running')", (now(),))
         # In-flight model calls cannot resume after process restart. Release
         # their reservation without duplicating an accepted candidate.
         conn.execute("UPDATE exam_papers SET status='ready',generation_token=NULL,generation_started=NULL "
@@ -233,6 +239,11 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        exam_tasks = list(_app.state.exam_generation_tasks.values())
+        for task in exam_tasks:
+            task.cancel()
+        if exam_tasks:
+            await asyncio.gather(*exam_tasks, return_exceptions=True)
         worker.cancel()
         assessment_worker.cancel()
         for task in (worker, assessment_worker):
@@ -410,6 +421,17 @@ async def delete_course(course_id: str):
     # Prevent a running generation from writing new records after its owning
     # course is removed. Queued jobs become no-ops when the worker sees no row.
     await generation.cancel_running_jobs(jobs)
+    with database() as conn:
+        exam_run_ids = [row['id'] for row in conn.execute(
+            'SELECT r.id FROM exam_paper_generation_requests r '
+            'JOIN threads t ON t.id=r.thread_id WHERE t.course_id=? '
+            "AND r.status IN ('queued','running')", (course_id,))]
+    exam_tasks = [app.state.exam_generation_tasks[run_id] for run_id in exam_run_ids
+                  if run_id in app.state.exam_generation_tasks]
+    for task in exam_tasks:
+        task.cancel()
+    if exam_tasks:
+        await asyncio.gather(*exam_tasks, return_exceptions=True)
     try:
         await asyncio.to_thread(_delete_course_data, course_id)
     except OSError as exc:
@@ -450,9 +472,19 @@ def create_thread(data: ThreadInput):
 
 
 @app.delete("/api/threads/{thread_id}", status_code=204)
-def delete_thread(thread_id: str):
+async def delete_thread(thread_id: str):
     with database() as conn:
         fetch_or_404(conn, "threads", thread_id)
+        run_ids = [row['id'] for row in conn.execute(
+            'SELECT id FROM exam_paper_generation_requests WHERE thread_id=? '
+            "AND status IN ('queued','running')", (thread_id,))]
+    tasks = [app.state.exam_generation_tasks[run_id] for run_id in run_ids
+             if run_id in app.state.exam_generation_tasks]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    with database() as conn:
         conn.execute("DELETE FROM threads WHERE id=?", (thread_id,))
 
 
@@ -1232,6 +1264,92 @@ def approve_exam_blueprint(thread_id: str):
         return exam_builder.approve(conn, thread_id)
 
 
+class ExamGenerationStart(BaseModel):
+    regenerate: bool = False
+    candidate_id: str | None = None
+
+
+async def _run_exam_generation(request_id: str, thread_id: str, regenerate: bool) -> None:
+    """Run a slow provider call off the HTTP request, persisting its outcome."""
+    try:
+        with database() as conn:
+            updated = conn.execute(
+                "UPDATE exam_paper_generation_requests SET status='running',updated_at=? "
+                "WHERE id=? AND status='queued'", (now(), request_id))
+            if updated.rowcount != 1:
+                return  # cancelled or deleted before starting
+        await exam_builder.generate_next(thread_id, regenerate=regenerate)
+        status, error = 'succeeded', None
+    except asyncio.CancelledError:
+        # Cancellation never changes an already accepted question.
+        with database() as conn:
+            conn.execute("UPDATE exam_paper_generation_requests SET status='cancelled',updated_at=? "
+                         "WHERE id=? AND status IN ('queued','running')", (now(), request_id))
+        raise
+    except HTTPException as exc:
+        status, error = 'failed', str(exc.detail)[:500]
+    except Exception:
+        logging.getLogger(__name__).exception('Exam generation worker failed for thread %s', thread_id)
+        status, error = 'failed', 'Question generation failed. Check the FastAPI logs and retry.'
+    with database() as conn:
+        # A cancelled request must not be marked successful by a late model response.
+        conn.execute("UPDATE exam_paper_generation_requests SET status=?,error=?,updated_at=? "
+                     "WHERE id=? AND status='running'", (status, error, now(), request_id))
+
+
+@app.post('/api/threads/{thread_id}/exam/paper/generation/start', status_code=202)
+async def start_exam_generation(thread_id: str, payload: ExamGenerationStart):
+    """Return immediately; the browser polls the durable generation request."""
+    with database() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        fetch_or_404(conn, 'threads', thread_id)
+        paper, _ = exam_builder._valid_paper(conn, thread_id, require_ready=True)
+        if paper['status'] != 'ready':
+            raise HTTPException(status_code=409, detail='A question is already generating or the paper is not ready')
+        if payload.regenerate:
+            if not payload.candidate_id or paper['candidate_id'] != payload.candidate_id:
+                raise HTTPException(status_code=409, detail='Candidate changed; refresh the draft')
+        elif paper['candidate']:
+            raise HTTPException(status_code=409, detail='Review the current candidate before generating another')
+        ongoing = conn.execute("SELECT 1 FROM exam_paper_generation_requests "
+                               "WHERE thread_id=? AND status IN ('queued','running') LIMIT 1", (thread_id,)).fetchone()
+        if ongoing:
+            raise HTTPException(status_code=409, detail='A question is already generating')
+        request_id = identifier()
+        conn.execute("INSERT INTO exam_paper_generation_requests(id,thread_id,status,created_at,updated_at) "
+                     "VALUES(?,?,'queued',?,?)", (request_id, thread_id, now(), now()))
+    task = asyncio.create_task(_run_exam_generation(request_id, thread_id, payload.regenerate))
+    app.state.exam_generation_tasks[request_id] = task
+
+    def finish(done: asyncio.Task) -> None:
+        app.state.exam_generation_tasks.pop(request_id, None)
+        if not done.cancelled() and done.exception():
+            logging.getLogger(__name__).error('Exam worker crashed: %s', done.exception())
+
+    task.add_done_callback(finish)
+    return {'request_id': request_id, 'status': 'queued'}
+
+
+@app.get('/api/threads/{thread_id}/exam/paper/generation/latest')
+def latest_exam_generation_status(thread_id: str):
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+        result = conn.execute('SELECT id,status,error FROM exam_paper_generation_requests '
+                              'WHERE thread_id=? ORDER BY created_at DESC LIMIT 1', (thread_id,)).fetchone()
+        return {**dict(result), 'paper': exam_builder.read(conn, thread_id)} if result else None
+
+
+@app.get('/api/threads/{thread_id}/exam/paper/generation/{request_id}')
+def exam_generation_status(thread_id: str, request_id: str):
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+        result = conn.execute('SELECT id,status,error FROM exam_paper_generation_requests '
+                              'WHERE id=? AND thread_id=?', (request_id, thread_id)).fetchone()
+        if result is None:
+            raise HTTPException(status_code=404, detail='Generation request not found in this conversation')
+        return {**dict(result), 'paper': exam_builder.read(conn, thread_id)}
+
+
 @app.post('/api/threads/{thread_id}/exam/paper/next')
 async def next_exam_candidate(thread_id: str):
     with database() as conn:
@@ -1321,11 +1439,27 @@ def export_interactive_exam_paper(thread_id: str, audience: Literal['student','i
 
 
 @app.post('/api/threads/{thread_id}/exam/paper/cancel')
-def cancel_interactive_generation(thread_id: str):
+async def cancel_interactive_generation(thread_id: str):
     with database() as conn:
         conn.execute('BEGIN IMMEDIATE')
         fetch_or_404(conn, 'threads', thread_id)
-        return exam_builder.cancel_generation(conn, thread_id)
+        ongoing = [row['id'] for row in conn.execute(
+            "SELECT id FROM exam_paper_generation_requests WHERE thread_id=? "
+            "AND status IN ('queued','running')", (thread_id,))]
+        paper = exam_builder.read(conn, thread_id)
+        if paper and paper['status'] == 'generating':
+            result = exam_builder.cancel_generation(conn, thread_id)
+        elif ongoing:
+            result = paper  # a queued task has not reserved the paper yet
+        else:
+            raise HTTPException(status_code=409, detail='No active generation to cancel')
+        conn.execute("UPDATE exam_paper_generation_requests SET status='cancelled',updated_at=? "
+                     "WHERE thread_id=? AND status IN ('queued','running')", (now(), thread_id))
+    for request_id in ongoing:
+        task = app.state.exam_generation_tasks.get(request_id)
+        if task is not None:
+            task.cancel()
+    return result
 
 
 @app.get('/api/threads/{thread_id}/exam/paper/events')

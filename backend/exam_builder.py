@@ -132,6 +132,15 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
         created_at REAL NOT NULL
     );
     CREATE INDEX IF NOT EXISTS exam_paper_events_thread ON exam_paper_events(thread_id, id);
+    CREATE TABLE IF NOT EXISTS exam_paper_generation_requests (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES exam_papers(thread_id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed','cancelled')),
+        error TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS exam_generation_thread ON exam_paper_generation_requests(thread_id,created_at DESC);
     ''')
     for name, definition in (('final_approved_at', 'REAL'), ('final_signature', 'TEXT')):
         if name not in {r['name'] for r in conn.execute('PRAGMA table_info(exam_papers)')}:

@@ -24,6 +24,11 @@ test('scroll follows new messages but shows an accessible latest button for read
   assert.match(page, /followConversationRef\.current/);
   assert.match(page, /setShowScrollDown\(distance > 145\)/);
   assert.match(page, /aria-label="Scroll to latest message"/);
+  assert.match(page, /\{showScrollDown && <button[^\n]*><ArrowDown size=\{19\} aria-hidden="true"\/><\/button>/);
+  assert.doesNotMatch(page, /<span>Latest<\/span>/);
+  assert.match(css, /\.qg-scroll-latest \{[^}]*left: 50%/);
+  assert.match(css, /\.qg-scroll-latest \{[^}]*transform: translateX\(-50%\)/);
+  assert.match(css, /\.qg-scroll-latest:hover \{ transform: translate\(-50%, -2px\)/);
   assert.match(page, /scrollToLatest\(true\)/);
   assert.match(page, /prefers-reduced-motion: reduce/);
 });
@@ -46,6 +51,6 @@ test('exam paper uses editor theme, accessible progress, and compact status card
 
 test('backend errors identify failing routes and can retry transient refresh reads', () => {
   assert.match(page, /\[500, 502, 503, 504\]/);
-  assert.match(page, /Check the FastAPI terminal for the traceback/);
+  assert.match(page, /Check both the Next\.js and FastAPI terminals/);
   assert.match(page, /workspaceMode === "exam"\) \{ setAssessment\(null\)/);
 });

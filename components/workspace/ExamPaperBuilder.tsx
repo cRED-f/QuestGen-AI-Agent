@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Check, ChevronDown, Loader2, PenLine, RefreshCw, SkipForward } from "lucide-react";
 import type { ExamRequirements } from "@/components/workspace/ExamConfiguration";
 import ExamChoiceSelect from "@/components/workspace/ExamChoiceSelect";
+import FormattedMessage from "@/components/workspace/FormattedMessage";
 
 export type PaperSection = { id: string; kind: string; count: number; marks_each: number; topic: string; difficulty: string };
 export type PaperBlueprint = { title: string; instructions: string; sections: PaperSection[] };
@@ -81,7 +82,7 @@ export default function ExamPaperBuilder({ paper, requirements, busy, onPrepare,
     {candidate ? <div key={paper.candidate_id ?? paper.candidate_slot ?? "candidate"} className="qg-candidate">
       <div className="qg-candidate-meta"><span>{paper.next_slot?.kind.replaceAll("_"," ")} · {paper.next_slot?.marks} marks</span><span>{paper.next_slot?.topic}</span></div>
       {editingCandidate ? <QuestionFields initial={candidate} busy={busy} onSave={async edits => { await onEditCandidate(edits); setEditingCandidate(false); }} onCancel={() => setEditingCandidate(false)}/> : <>
-        <h3>{candidate.stem}</h3>
+        <div className="qg-question-rich questgen-prose"><FormattedMessage content={candidate.stem}/></div>
         {candidate.options.length > 0 && <ol className="qg-candidate-options" type="A">{candidate.options.map((option,i) => <li key={i}>{option}</li>)}</ol>}
         <details className="qg-candidate-answer"><summary>Answer and sources <ChevronDown size={14}/></summary><p><strong>Answer:</strong> {candidate.correct_answer}</p><p>{candidate.explanation}</p>
           <p>{candidate.grounded ? "Sources cited from course material" : "No document citations; review academic correctness"}</p></details>

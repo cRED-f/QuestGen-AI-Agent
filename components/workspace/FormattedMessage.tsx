@@ -45,6 +45,73 @@ function delimiterAlignment(line: string, expected: number): TablePart["align"] 
 }
 
 /**
+ * Some model providers collapse a complete Markdown table onto one line:
+ * "Question ... | Col A | Col B | |---|---| | x | y |".
+ * Recreate line boundaries only when a valid header, delimiter and at least one
+ * complete row are present. Ordinary prose containing pipes stays unchanged.
+ */
+export function expandFlattenedTable(line: string): string[] {
+  const separator = /\|\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|/g;
+  for (const match of Array.from(line.matchAll(separator))) {
+    const delimiterStart = match.index ?? -1;
+    if (delimiterStart < 0) continue;
+    const align = cells(match[0]);
+    const columnCount = align.length;
+    if (columnCount < 2 || columnCount > 12 || !delimiterAlignment(match[0], columnCount)) continue;
+    const before = line.slice(0, delimiterStart);
+    // A proper one-line header must have n+1 border pipes before the separator.
+    const bars = Array.from(before.matchAll(/(?<!\\)\|/g), (bar) => bar.index ?? -1);
+    if (bars.length < columnCount + 1) continue;
+    const headerStart = bars[bars.length - columnCount - 1];
+    const header = before.slice(headerStart).trim();
+    const headings = cells(header);
+    if (headings.length !== columnCount || headings.some((heading) => !heading)) continue;
+
+    let rest = line.slice(delimiterStart + match[0].length);
+    const rows: string[] = [];
+    while (rows.length < 100) {
+      const candidate = rest.trimStart();
+      if (!candidate.startsWith("|")) break;
+      let cursor = 1;
+      let inCode = 0;
+      let escaped = false;
+      let complete = true;
+      for (let col = 0; col < columnCount; col += 1) {
+        let next = -1;
+        for (let pos = cursor; pos < candidate.length; pos += 1) {
+          const char = candidate[pos];
+          if (escaped) { escaped = false; continue; }
+          if (char === "\\") { escaped = true; continue; }
+          if (char === "`") {
+            let length = 1;
+            while (candidate[pos + length] === "`") length += 1;
+            if (inCode === length) inCode = 0;
+            else if (!inCode) inCode = length;
+            pos += length - 1;
+            continue;
+          }
+          if (char === "|" && !inCode) { next = pos; break; }
+        }
+        if (next < 0) { complete = false; break; }
+        cursor = next + 1;
+      }
+      if (!complete) break;
+      rows.push(candidate.slice(0, cursor).trimEnd());
+      rest = candidate.slice(cursor);
+    }
+    if (!rows.length) continue;
+    const introduction = before.slice(0, headerStart).trim();
+    const trailing = rest.trim();
+    return [
+      ...(introduction ? [introduction, ""] : []),
+      header, match[0], ...rows,
+      ...(trailing ? ["", trailing] : []),
+    ];
+  }
+  return [line];
+}
+
+/**
  * The current dependency lock has CommonMark but no GFM plugin. Convert valid
  * pipe tables into table elements without reinterpreting fenced code blocks.
  * This avoids a new un-lockable package and leaves other Markdown untouched.
@@ -65,6 +132,14 @@ export function splitMessageMarkdown(markdown: string): Part[] {
       else if (marker[0] === fenceChar && marker.length >= fenceLength && !line.slice(fence[0].length).trim()) { fenceChar = ""; fenceLength = 0; }
       buffer.push(line);
       continue;
+    }
+    if (!fenceChar && line.includes("|")) {
+      const expanded = expandFlattenedTable(line);
+      if (expanded.length > 1) {
+        lines.splice(i, 1, ...expanded);
+        i -= 1;
+        continue;
+      }
     }
     if (!fenceChar && i + 1 < lines.length && line.includes("|")) {
       const headings = cells(line);

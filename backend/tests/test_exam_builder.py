@@ -128,3 +128,34 @@ def test_invalid_edits_and_nonmatching_document_scope(client):
     request(client, 'POST', root + '/paper/approve')
     assert client.post(root + '/paper/accept', json={'candidate_id':'missing-candidate'}).status_code == 409
     assert client.put(root + '/paper/order', json={'question_ids':['unknown']}).status_code == 422
+
+
+def test_40_mark_essay_generates_after_approved_blueprint(client, monkeypatch):
+    """The exam setup allows up to 100 marks per question; generation must agree."""
+    course_id = client.get('/api/courses').json()[0]['id']
+    thread_id = client.post('/api/threads', json={'course_id': course_id}).json()['id']
+    root = f'/api/threads/{thread_id}/exam'
+    formats = [{'kind': 'long_answer', 'count': 1, 'marks_each': 40}]
+    requirements = {'faculty_initials': 'FI', 'university_name': 'Example University',
+                    'exam_type': 'midterm', 'total_marks': 40, 'difficulty': 'moderate',
+                    'question_formats': formats, 'material_scope': 'general'}
+    assert client.patch(root + '/requirements', json={'updates': requirements}).status_code == 200
+    assert client.post(root + '/approve').status_code == 200
+    assert client.post(root + '/paper/prepare').status_code == 200
+    assert client.post(root + '/paper/approve').status_code == 200
+
+    async def generate(_settings, plan, _sources, _feedback=''):
+        assert plan.marks == 40
+        return generation.GeneratedQuestion(
+            stem='Explain this concept with relevant examples and a detailed argument.',
+            options=[], correct_answer='A structured, evidence-based explanation',
+            explanation='The answer should use relevant examples and clear reasoning.',
+            source_ids=[])
+
+    monkeypatch.setattr(generation, 'generate_question', generate)
+    monkeypatch.setattr(service, 'model_credentials', lambda settings: ('http://test/', {}))
+    with service.database() as conn:
+        conn.execute("UPDATE workspace_settings SET model='mock-model' WHERE id=1")
+    response = client.post(root + '/paper/next')
+    assert response.status_code == 200, response.text
+    assert response.json()['candidate']['stem'].startswith('Explain this concept')

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import FormattedMessage from "@/components/workspace/FormattedMessage";
 import { ArrowDown, ArrowUp, CheckCircle2, Download, Pencil, Trash2, FileText, Layers3, Eye, EyeOff } from "lucide-react";
 import type { ExamPaper, QuestionEdits } from "./ExamPaperBuilder";
 import type { ExamRequirements } from "./ExamConfiguration";
@@ -58,7 +59,7 @@ export default function ExamPaperSidebar({ paper, requirements, busy, onEdit, on
           <h4>Section {i+1}: {section.kind.replaceAll("_"," ")} <span>{questions.length}/{section.count}</span></h4>
           {questions.length ? questions.map(question => <article key={question.id} className="qg-sheet-question">
             {editingId === question.id ? <QuestionFields initial={question.content} busy={busy} onSave={async change => {await onEdit(question.id,change); setEditingId(null);}} onCancel={() => setEditingId(null)}/> : <>
-              <p><strong>Q{question.position}.</strong> {question.content.stem} <b>({question.content.marks})</b></p>
+              <div className="qg-sheet-question-stem"><strong>Q{question.position}.</strong><div className="qg-question-rich questgen-prose"><FormattedMessage content={question.content.stem}/></div><b>({question.content.marks})</b></div>
               {question.content.options.length > 0 && <ol type="A">{question.content.options.map((option,j) => <li key={j}>{option}</li>)}</ol>}
               {showAnswers && <p className="qg-sheet-answer"><strong>Answer:</strong> {question.content.correct_answer}</p>}
               <div className="qg-sheet-controls">
