@@ -1,258 +1,185 @@
-QuestGen-AI is an advanced exam question generation platform that leverages AI-Agent to automatically create customized question papers from user-uploaded PDF content. Built for educators and assessment creators, QuestGen-AI streamlines the often time-consuming process of creating high-quality assessment materials.
+# QuestGen
 
-https://github.com/user-attachments/assets/6ea7c368-2001-4062-a866-95c43651b92a
+**A local-first, chat-based assessment workspace for professors.**
 
-## 🚀 Features
+QuestGen lets you organize course materials, discuss them with an AI assistant, draft an assessment, revise individual questions, review and approve the results, and export student or instructor copies. Its interface uses a paper-and-pencil-inspired design rather than a landing-page-first workflow.
 
-- **AI-Powered Question Generation**: Creates high-quality, contextually relevant questions from PDF content using advanced language models
-- **Multiple Question Types**: Supports various question formats including multiple-choice, true/false, short answer, and essay questions
-- **Customizable Parameters**: Set question paper parameters such as marks, difficulty levels, and question distribution
-- **Institutional Branding**: Include custom headers with institution name, course details, and exam information
-- **PDF Document Processing**: Upload and extract content from PDF study materials, textbooks, or lecture notes
-- **Real-time Generation**: Watch as your question paper is created through a streaming interface
-- **Multi-Agent Architecture**: Utilizes specialized AI agents for extraction, creation, analysis, and formatting of questions
-- **Markdown Export**: Generated question papers are formatted in clean, structured Markdown for easy export to other formats
-- **Cloud File Storage**: Uses Convex for secure file uploads, storage, and management
+> **Status:** Active development. QuestGen is designed for **one trusted local user**. It intentionally has **no authentication**, and course separation is a data filter, **not a multi-user security boundary**. Do not expose the backend, model credentials, or uploaded documents on a public network.
 
-## 🧠 How It Works
+## Current features
 
-![total system](https://github.com/user-attachments/assets/a972a4ec-632e-4c6c-a2e4-fdcfd624fd83)
+- **Chat workspace:** streamed model replies, persisted conversations, message editing in the main composer, response regeneration, and direct conversation deletion.
+- **Courses:** create and switch courses; each has its own chat history and material Library.
+- **Material Library:** upload, browse, attach, search, open, delete, diagnose OCR and reprocess files. Chat and assessment generation can retrieve from a selected subset of materials, or from the active course if none are selected.
+- **Document extraction:** PDF, DOCX, PPTX, TXT, Markdown, PNG, JPG/JPEG, WEBP, BMP and TIFF. PowerPoint processing includes slide text, tables, speaker notes and embedded images; images use optional OCR and/or an Ollama vision model.
+- **Retrieval and citations:** SQLite full-text search with optional Ollama embeddings, course filters, and page/slide references when available.
+- **Model providers:** 9Router, OpenAI, Anthropic, OpenRouter and Ollama. Configure credentials/connection in Model Settings, then select an available model in chat.
+- **Assessment drafts:** Deep Agents-based blueprint planning followed by bounded question generation, validation and review. SQLite stores the blueprint, completed questions, progress events and restart recovery state.
+- **Question review:** edit or selectively regenerate a question, use conversational customization, lock/unlock, inspect versions, restore an older revision, and approve or reject individual questions.
+- **Exports:** separate PDF/DOCX student and instructor copies. Student export requires approval of every question and excludes answer keys; instructor export includes answers and explanations.
 
-QuestGen-AI employs a sophisticated multi-agent system powered by LangChain and large language models:
+Generated questions are **drafts**. AI academic reviews do not replace a professor's judgment or establish factual correctness.
 
-1. **Extractor Agent**: Analyzes your input requirements to understand the exam type, total marks, question types, and subject areas
+## Implementation overview
 
-2. **Question Creator Agent**: Generates appropriate questions based on the extracted requirements and the content of the uploaded PDFs
+| Layer | Current implementation |
+| --- | --- |
+| Interface | Next.js 16.4.0, React 19.3.0, TypeScript, Tailwind CSS |
+| Backend | FastAPI, Python, Pydantic |
+| AI | Provider HTTP streaming; Deep Agents supervisor for assessment blueprints; separate structured generation/review calls |
+| Persistence | Local SQLite (courses, messages, documents, assessments, question versions, provider settings) |
+| Retrieval | SQLite FTS5; optional Ollama embeddings; citations to stored passages |
+| Extraction | pypdf, python-docx, python-pptx, Pillow, optional Tesseract and Ollama vision |
+| Output | ReportLab PDF and python-docx DOCX |
 
-3. **Question Analysis Agent**: Evaluates the generated questions for quality, clarity, relevance, and alignment with requirements
+Normal chat uses direct model streaming; **not every chat turn runs Deep Agents**. Deep Agents is used for planning a structured assessment. Generation and review then use bounded model calls. Work is processed by local in-process workers, not a distributed task queue.
 
-4. **Decider Agent**: Determines if the questions meet all requirements or need further refinement
+## Prerequisites
 
-5. **Formatter Agent**: Arranges the questions into a professionally formatted exam paper with clear sections and instructions
+- Node.js **20.9 or newer**, plus npm.
+- A supported Python 3 installation and pip (Python **3.11+ recommended**).
+- An AI provider endpoint and an available model. For local models, install and start [Ollama](https://ollama.com/).
+- **Optional:** Tesseract OCR on the backend computer for images and embedded slide images; a compatible Ollama vision model for diagram descriptions.
 
-This multi-step process ensures high-quality, relevant questions that align with your specific needs and content.
+Docker, Kubernetes, Convex and sign-in accounts are **not required** for the current local workflow. Some old Convex/Next.js service code remains in the repository but is not the primary application backend.
 
-## 🛠️ Technology Stack
+## Install and run
 
-- **Frontend**: Next.js, React, TailwindCSS, Framer Motion
-- **Backend**: Next.js API routes
-- **AI Integration**: LangChain, OpenRouter API (compatible with various LLM models)
-- **PDF Processing**: PDF.js, pdf-parse
-- **Styling**: Custom UI components with Tailwind CSS and Framer Motion animations
-- **Streaming**: Server-Sent Events (SSE) for real-time content streaming
-- **Database & Storage**: Convex for file uploads, storage, and management
+Run commands from the repository root. The frontend and backend are separate processes.
 
-## 📋 Requirements
+### 1. Install Python requirements
 
-- Node.js (v18.0 or later)
-- npm or yarn package manager
-- OpenRouter API key (for accessing AI models)
-- Convex account (for file storage)
-- Modern web browser
+**Windows PowerShell**:
 
-## 🔧 Installation & Setup
-
-1. **Clone the repository**
-
-   ```bash
-   https://github.com/cRED-f/QuestGen-AI-Agent.git
-   cd QuestGen-AI
-   ```
-
-2. **Install dependencies**
-
-   ```bash
-   npm install
-   # or
-   yarn install
-   ```
-
-3. **Set up environment variables**
-
-   Create a `.env.local` file in the project root with:
-
-   ```
-   NEXT_PUBLIC_OPENROUTER_SITE_URL="http://localhost:3000"
-   OPENROUTER_API_BASE="https://openrouter.ai/api/v1"
-   NEXT_PUBLIC_CONVEX_URL="your_convex_deployment_url"
-   ```
-
-4. **Initialize Convex**
-
-   ```bash
-   npx convex init
-   ```
-
-   Follow the prompts to connect to your Convex account and create a new deployment.
-
-5. **Run the development server**
-
-   ```bash
-   npm run dev
-   # or
-   yarn dev
-   ```
-
-6. **Access the application**
-
-   Open [http://localhost:3000](http://localhost:3000) in your web browser
-
-## 💻 Usage Guide
-
-### Generating an Exam Paper
-
-1. **Navigate to the Question Generator page**
-
-   From the homepage, click "Start For Free" or navigate to `/chat` route.
-
-2. **Upload Content**
-
-   Use the file upload area to drag and drop or select PDF documents containing the content from which questions should be generated.
-
-3. **Enter Question Paper Parameters**
-
-   - **Question Header**: Enter institutional information, exam details, and course information
-
-     - Example: "University of Technology - Midterm Examination - CS101: Introduction to Programming - Spring 2023"
-
-   - **Question Description**: Provide instructions and parameters for the question paper
-     - Example: "Create a question paper with 5 multiple-choice questions (2 marks each), 3 short-answer questions (5 marks each), and 1 essay question (10 marks). Focus on Python basics and data structures."
-
-4. **Enter API Key**
-
-   Provide your OpenRouter API key in the designated field. This is used to access the AI models that power the question generation.
-
-5. **Select Model (Optional)**
-
-   Choose the AI model to use for generation. The default is "qwen/qwq-32b:free".
-
-6. **Generate Questions**
-
-   Click the "Generate Question Paper" button to start the process. The system will:
-
-   - Process your PDF documents
-   - Extract relevant content
-   - Analyze requirements
-   - Create appropriate questions
-   - Format a complete exam paper
-
-7. **View and Export Results**
-
-   Once generation is complete, you can:
-
-   - Review the generated questions
-   - Copy the content
-   - Print or save the question paper
-
-## 📁 Project Structure
-
-```
-/
-├── app/                      # Next.js app directory
-│   ├── (root)/               # Root route group
-│   │   ├── chat/             # Question generation page
-│   │   └── page.tsx          # Home page
-│   ├── api/                  # API routes
-│   │   └── generate-questions/ # Question generation API
-│   ├── assets/               # Static assets
-│   ├── globals.css           # Global styles
-│   └── layout.tsx            # Root layout component
-├── components/               # Reusable React components
-│   ├── eldoraui/             # Custom UI components
-│   ├── ui/                   # Base UI components
-│   └── About.tsx             # About component
-├── convex/                   # Convex database schema and functions
-│   ├── _generated/           # Auto-generated Convex type definitions
-│   ├── files.ts              # File storage operations
-│   └── schema.ts             # Database schema
-├── lib/                      # Utility functions
-│   ├── prompts/              # AI prompt templates
-│   └── utils.ts              # Helper functions
-├── public/                   # Public assets
-├── services/                 # Core services
-│   └── index.ts              # Multi-agent question generation service
-├── temp/                     # Temporary directory for uploaded files
-├── .env.local                # Environment variables
-├── next.config.ts            # Next.js configuration
-├── package.json              # Project dependencies
-├── postcss.config.js         # PostCSS configuration
-└── tailwind.config.ts        # Tailwind CSS configuration
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r backend/requirements.txt
 ```
 
-## 🔄 API Documentation
+**macOS / Linux**:
 
-### POST `/api/generate-questions`
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r backend/requirements.txt
+```
 
-Uploads PDF files and initiates question generation.
+### 2. Run the backend
 
-**Request**:
+```bash
+python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000 --reload
+```
 
-- HTTP Method: `POST`
-- Content-Type: `multipart/form-data`
-- Body:
-  - `file-{index}`: PDF files
-  - `questionHeader`: String - Exam header details
-  - `questionDescription`: String - Question paper requirements
-  - `apiKey`: String - OpenRouter API key
-  - `modelName`: String (optional) - AI model name
+Confirm the backend responds at <http://127.0.0.1:8000/api/health>.
 
-**Response**:
+### 3. Install the frontend and run it
 
-- Status: `200 OK`
-- Body:
-  ```json
-  {
-    "message": "success",
-    "uploadedFiles": ["1234567890.pdf"]
-  }
-  ```
+In another terminal:
 
-### GET `/api/generate-questions`
+```bash
+npm install
+npm run dev
+```
 
-Generates questions based on previously uploaded files.
+Open <http://localhost:3000/chat>.
 
-**Request**:
+**Dependency lockfile:** The previous `package-lock.json` was generated for Next.js 15 / React 19.0 and does not match the pinned Next.js 16.4.0 / React 19.3.0 manifest. It was removed rather than supplying an invalid or fabricated replacement. On a machine with npm registry access, `npm install` resolves packages and generates a new `package-lock.json`. **Commit that newly generated lockfile** for reproducible installs. Afterward, CI/other machines should use `npm ci`. The updated lockfile and a complete Next.js production build could not be generated or verified in the offline review environment.
 
-- HTTP Method: `GET`
-- Query Parameters:
-  - `questionHeader`: String - Exam header details
-  - `questionDescription`: String - Question paper requirements
-  - `apiKey`: String - OpenRouter API key
-  - `modelName`: String (optional) - AI model name
-  - `uploadedFiles`: String - Comma-separated list of uploaded file names
+After installing dependencies, verify them:
 
-**Response**:
+```bash
+npm ls next react react-dom eslint-config-next --depth=0
+npm run typecheck
+npm run lint
+npm run build
+```
 
-- Content-Type: `text/event-stream`
-- Events:
-  - `data`: Contains generated content chunks
-  - `error`: Contains error information if generation fails
-  - `complete`: Signals generation completion
+## Configure an AI provider
 
-## 🔒 Security Considerations
+In QuestGen, open **Model Settings**, select a provider, configure the key and/or server address, and use the **Test connection** action. Then select an available model from the **chat model picker**. The backend stores configured credentials encrypted locally and does not send saved secret values back to the browser. Protect the database **and** its local encryption-key file when backing up or moving the application.
 
-- QuestGen-AI does not store your API keys permanently
-- Uploaded PDF files are securely stored in Convex and automatically deleted once question generation is complete
-- No user data is retained between sessions
-- API keys are transmitted securely but should still be protected carefully
+Environment variables are also supported (set them **before** starting FastAPI):
 
-## 🔮 Future Improvements
+| Provider | Variables |
+| --- | --- |
+| OpenAI | `OPENAI_API_KEY` |
+| Anthropic | `ANTHROPIC_API_KEY` |
+| OpenRouter | `OPENROUTER_API_KEY` |
+| 9Router | `QUESTGEN_9ROUTER_URL` (default `http://127.0.0.1:20128/v1`); optional `NINE_ROUTER_API_KEY` |
+| Ollama | `QUESTGEN_OLLAMA_URL` (default `http://127.0.0.1:11434`); optional `QUESTGEN_OLLAMA_API_KEY` for protected proxies |
 
-- User accounts for saving and organizing generated question papers
-- Additional question formats and customization options
-- Pre-built templates for common exam types
-- Batch generation of multiple question papers
-- Integration with learning management systems
-- Offline mode using local models
+Anthropic generation currently uses an OpenAI-compatible API path, while model discovery uses its model-list endpoint. Availability in the picker **does not guarantee** that a model supports tool calling or structured assessment generation. Test the actual generation workflow with your chosen model.
 
-## 🤝 Contributing
+## OCR, vision, and embeddings
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+For image text extraction, install the Tesseract executable, then check availability using **Course Materials → Check OCR**. On Windows, restart the backend after installing it; if automatic detection fails, set its path in the same PowerShell session where FastAPI starts:
 
----
+```powershell
+$env:QUESTGEN_TESSERACT_CMD = "C:\Program Files\Tesseract-OCR\tesseract.exe"
+```
 
-Built with ❤️ using Next.js, LangChain, Convex, and OpenRouter
+To describe diagrams with a local vision model, configure an **installed** Ollama-compatible model:
+
+```powershell
+$env:QUESTGEN_VISION_MODEL = "your-installed-vision-model"
+```
+
+For optional semantic retrieval, set:
+
+```powershell
+$env:QUESTGEN_EMBED_MODEL = "your-installed-embedding-model"
+```
+
+The embedding and vision pipelines use the configured Ollama connection. Without an embedding model, keyword search still works. Some images may not yield readable text even when Tesseract is correctly installed. PDF text extraction is supported, but **scanned PDFs with no embedded text are not yet OCR-processed**.
+
+Supported uploads are limited to **15 MiB per file**. Other extraction limits apply to total text, images, and slide/page counts.
+
+## Working with courses and assessments
+
+1. Select or create a course, then upload its lectures in **Library**.
+2. In chat, use **Materials** or **Attach course material** to choose previously uploaded files from the active course.
+3. Chat about the content or generate an exam. Selected files limit retrieval for that chat request or assessment; with none selected, retrieval can search all indexed files in the course.
+4. Inspect assessment generation progress and review the resulting draft.
+5. Edit or regenerate individual questions, apply a targeted conversational instruction, lock questions that should stay unchanged, and approve the final set.
+6. Export an approved **student** paper or an **instructor** copy with the answer key.
+
+AI revisions and selective regeneration respect the assessment's saved document selection. If a selected document has been deleted or is no longer ready, further AI revision fails clearly instead of retrieving evidence from another file. A previously saved question version is not itself an assertion that its citations are still available.
+
+## Storage and privacy
+
+By default, local application state is under `backend/data/`:
+
+- `questgen.sqlite3`: conversations, courses, indexed chunks, question drafts, versions and configuration.
+- `uploads/`: course files stored on disk.
+- `.questgen-provider.key`: encryption key for saved provider API credentials.
+- `deepagents-checkpoints.sqlite3`: local Deep Agents checkpoint data.
+
+The database location can be changed with `QUESTGEN_DB_PATH`, and uploads with `QUESTGEN_UPLOAD_DIR`. The Next.js API rewrite target can be changed with `QUESTGEN_API_ORIGIN` (default `http://127.0.0.1:8000`). API calls from the frontend are proxied through `/api/workspace/...`.
+
+**Security limitation:** There is intentionally no authentication. Course separation does not protect different people from accessing one another's data. Do not expose this development backend publicly or use it as an unrestricted shared multi-professor service.
+
+## Tests
+
+```bash
+python -m pip install -r backend/requirements-dev.txt
+python -m pytest backend/tests -q
+```
+
+The tests exercise persistence, provider configuration, course-scoped attachments, document ingestion and OCR diagnostics, generation persistence, customization, versioning, approvals and exports. They predominantly use mocked AI calls: passing tests **does not verify** live model quality or all browser interactions.
+
+After regenerating the npm lockfile with registry access, run `npm run typecheck`, `npm run lint` and `npm run build` before committing a deployable change.
+
+## Known limitations
+
+- No user authentication, multi-user authorization or publicly safe credential-management API.
+- No offline, professor-labeled evaluation benchmark or end-to-end browser test suite yet.
+- No reliable promise that every selectable provider/model supports structured output and Deep Agents tool calling.
+- No reusable cross-assessment question-bank editor or comprehensive assessment blueprint editor yet.
+- No scanned-PDF OCR, managed job worker, Kubernetes deployment, or production monitoring stack.
+- Content edits preserve existing question blueprint allocations such as marks, topic, type and Bloom's level.
+- The current local worker model assumes a single backend process; do not run multiple backend workers against the same SQLite job queue.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](./LICENSE) file for details.
+See [`LICENSE`](LICENSE).

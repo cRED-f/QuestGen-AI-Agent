@@ -178,3 +178,171 @@ def test_conversation_actions_commit_atomically(ctx, monkeypatch):
     assert result.status_code == 200
     assert client.get(prefix + '/questions/q1/versions').json()['review_status'] == 'approved'
     assert client.get(prefix + '/questions/q2/versions').json()['locked'] is True
+
+
+def _material_for_revision(client, course_id: str, name: str, body: str) -> str:
+    response = client.post(
+        f'/api/courses/{course_id}/documents',
+        files={'file': (name, body.encode('utf-8'), 'text/plain')},
+    )
+    assert response.status_code == 201, response.text
+    document_id = response.json()['id']
+    for _ in range(200):
+        item = client.get(f'/api/courses/{course_id}/documents/{document_id}').json()
+        if item['status'] in ('ready', 'failed'):
+            assert item['status'] == 'ready', item
+            return document_id
+        time.sleep(0.01)
+    pytest.fail('Document indexing timed out')
+
+
+def test_ai_question_regeneration_respects_attached_assessment_materials(ctx, monkeypatch):
+    client, prefix, job_id = ctx
+    with module.database() as conn:
+        course_id = conn.execute('SELECT course_id FROM assessment_jobs WHERE id=?', (job_id,)).fetchone()['course_id']
+    selected = _material_for_revision(client, course_id, 'selected.txt',
+        'Binary search of sorted arrays uses a midpoint and repeated halving. ' * 5)
+    excluded = _material_for_revision(client, course_id, 'excluded.txt',
+        'Binary search in sorted sequences runs in logarithmic time. ' * 5)
+    foreign_course = client.post('/api/courses', json={'name': 'Separate course'}).json()['id']
+    foreign = _material_for_revision(client, foreign_course, 'foreign.txt',
+        'Binary search works on sorted arrays in this unrelated course. ' * 5)
+    with module.database() as conn:
+        conn.execute('UPDATE assessment_jobs SET document_ids=? WHERE id=?',
+                     (json.dumps([selected]), job_id))
+    evidence_seen = []
+
+    async def fake_model(settings, system, payload):
+        evidence_seen.extend(payload['evidence'])
+        return {
+            'stem': 'Which requirement allows binary search to locate an element efficiently?',
+            'options': ['Sorted array', 'Unordered collection', 'Linked list only', 'Randomized order'],
+            'correct_answer': 'Sorted array',
+            'explanation': 'A sorted array supports ordered midpoint comparisons and repeated halving.',
+            'source_ids': [payload['evidence'][0]['id']],
+        }
+
+    async def review(*args, **kwargs):
+        return generation.QualityReview(passed=True)
+
+    monkeypatch.setattr(generation, 'model_json', fake_model)
+    monkeypatch.setattr(generation, 'review_question', review)
+    response = client.post(prefix + '/questions/q1/regenerate', json={
+        'expected_version': 1, 'instruction': 'Rewrite with a practical example',
+    })
+    assert response.status_code == 200, response.text
+    saved_sources = response.json()['content']['sources']
+    assert {source['document_id'] for source in saved_sources} == {selected}
+    assert evidence_seen
+    assert excluded not in {source['document_id'] for source in saved_sources}
+    assert foreign not in {source['document_id'] for source in saved_sources}
+
+
+def test_ai_revision_rejects_deleted_selected_document_before_model_call(ctx, monkeypatch):
+    client, prefix, job_id = ctx
+    with module.database() as conn:
+        course_id = conn.execute('SELECT course_id FROM assessment_jobs WHERE id=?', (job_id,)).fetchone()['course_id']
+    selected = _material_for_revision(client, course_id, 'missing-after-delete.txt',
+        'Binary search uses midpoint comparisons in sorted collections.')
+    with module.database() as conn:
+        conn.execute('UPDATE assessment_jobs SET document_ids=? WHERE id=?',
+                     (json.dumps([selected]), job_id))
+    assert client.delete(f'/api/courses/{course_id}/documents/{selected}').status_code == 204
+
+    async def unexpected_model(*args, **kwargs):
+        pytest.fail('Model must not run when an assessment source is unavailable')
+
+    monkeypatch.setattr(generation, 'model_json', unexpected_model)
+    response = client.post(prefix + '/questions/q1/regenerate', json={
+        'expected_version': 1, 'instruction': 'Use a different wording',
+    })
+    assert response.status_code == 409
+    assert client.get(prefix + '/questions/q1/versions').json()['version'] == 1
+
+
+def test_original_citations_cannot_override_assessment_attachment_filter(ctx, monkeypatch):
+    client, prefix, job_id = ctx
+    with module.database() as conn:
+        course_id = conn.execute('SELECT course_id FROM assessment_jobs WHERE id=?', (job_id,)).fetchone()['course_id']
+    selected = _material_for_revision(client, course_id, 'selected-unrelated.txt',
+        'Photosynthesis absorbs sunlight through chlorophyll pigment.')
+    excluded = _material_for_revision(client, course_id, 'old-citation.txt',
+        'Binary search requires a sorted collection and checks the midpoint.')
+    with module.database() as conn:
+        chunk_id = conn.execute('SELECT id FROM document_chunks WHERE document_id=?', (excluded,)).fetchone()['id']
+        old = json.loads(conn.execute('SELECT content FROM assessment_questions WHERE id=?', ('q1',)).fetchone()['content'])
+        old['source_ids'] = [chunk_id]
+        old['sources'] = [{'chunk_id': chunk_id, 'document_id': excluded, 'snippet': 'Wrong attachment'}]
+        conn.execute('UPDATE assessment_questions SET content=? WHERE id=?', (json.dumps(old), 'q1'))
+        conn.execute('UPDATE assessment_jobs SET document_ids=? WHERE id=?',
+                     (json.dumps([selected]), job_id))
+    evidence_seen = []
+
+    async def fake_model(settings, system, payload):
+        assert chunk_id not in json.dumps(payload)
+        assert excluded not in json.dumps(payload)
+        evidence_seen.extend(payload['evidence'])
+        return {
+            'stem': 'What does a binary search algorithm need before it can compare midpoints?',
+            'options': ['Sorted input', 'Random order', 'An unbalanced tree', 'No arrangement'],
+            'correct_answer': 'Sorted input',
+            'explanation': 'Binary search only works reliably with ordered input for midpoint checks.',
+            'source_ids': [],
+        }
+
+    async def review(*args, **kwargs):
+        return generation.QualityReview(passed=True)
+
+    monkeypatch.setattr(generation, 'model_json', fake_model)
+    monkeypatch.setattr(generation, 'review_question', review)
+    result = client.post(prefix + '/questions/q1/revise', json={
+        'expected_version': 1, 'instruction': 'Clarify the precondition',
+    })
+    assert result.status_code == 200, result.text
+    assert evidence_seen == []
+    assert result.json()['content']['source_ids'] == []
+    assert result.json()['content']['sources'] == []
+
+
+def test_conversational_revision_uses_the_same_assessment_source_scope(ctx, monkeypatch):
+    client, prefix, job_id = ctx
+    with module.database() as conn:
+        course_id = conn.execute('SELECT course_id FROM assessment_jobs WHERE id=?', (job_id,)).fetchone()['course_id']
+    selected = _material_for_revision(client, course_id, 'lecture-selected.txt',
+        'Binary search requires sorted data and repeatedly compares the middle element.')
+    excluded = _material_for_revision(client, course_id, 'lecture-excluded.txt',
+        'Binary search usually starts by checking the midpoint of sorted input.')
+    with module.database() as conn:
+        conn.execute('UPDATE assessment_jobs SET document_ids=? WHERE id=?',
+                     (json.dumps([selected]), job_id))
+    references = []
+
+    async def fake_model(settings, system, request):
+        if system.startswith('Translate professor instructions'):
+            return {'actions': [{'ordinal': 1, 'operation': 'revise', 'instruction': 'Add practical context'}]}
+        references.extend(request['evidence'])
+        return {
+            'stem': 'Which property of an array lets binary search discard half its elements?',
+            'options': ['Sorted elements', 'Unsorted elements', 'Random pointers', 'Mixed data types'],
+            'correct_answer': 'Sorted elements',
+            'explanation': 'Sorted input makes midpoint comparisons useful for narrowing the search.',
+            'source_ids': [request['evidence'][0]['id']],
+        }
+
+    async def review(*args, **kwargs):
+        return generation.QualityReview(passed=True)
+
+    monkeypatch.setattr(generation, 'model_json', fake_model)
+    monkeypatch.setattr(generation, 'review_question', review)
+    response = client.post(prefix + '/customize', json={
+        'instruction': 'Revise question 1 to include a practical context',
+    })
+    assert response.status_code == 200, response.text
+    assert len(references) == 1
+    with module.database() as conn:
+        selected_chunk = conn.execute('SELECT id FROM document_chunks WHERE document_id=?', (selected,)).fetchone()['id']
+        excluded_chunk = conn.execute('SELECT id FROM document_chunks WHERE document_id=?', (excluded,)).fetchone()['id']
+    assert references[0]['id'] == selected_chunk
+    assert excluded_chunk not in {r['id'] for r in references}
+    revised = client.get(prefix + '/questions/q1/versions').json()['content']
+    assert {s['document_id'] for s in revised['sources']} == {selected}

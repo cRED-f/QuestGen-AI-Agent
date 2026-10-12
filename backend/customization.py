@@ -215,14 +215,43 @@ async def prepare_ai_revision(job_id: str, question_id: str, expected: int, inst
         original = json.loads(row['content'])
         job = conn.execute('SELECT * FROM assessment_jobs WHERE id=?', (job_id,)).fetchone()
         settings = {'provider': job['provider'], 'model': job['model']}
+        # Preserve the original assessment's source selection through every revision,
+        # including edits triggered by natural-language customization.
+        document_ids = json.loads(job['document_ids'] or '[]')
+        if document_ids:
+            try:
+                documents.verify_course_documents(conn, job['course_id'], document_ids)
+            except ValueError as exc:
+                raise HTTPException(
+                    409, 'An attached assessment material is no longer available; restore the material before revising'
+                ) from exc
     plan = generation.QuestionPlan.model_validate(original)
-    sources = await __import__('asyncio').to_thread(documents.retrieve, job['course_id'], plan.topic, 5)
-    if not sources and original.get('sources'):
-        sources = original['sources']
+    sources = await __import__('asyncio').to_thread(
+        documents.retrieve, job['course_id'], plan.topic, 5, document_ids or None
+    )
+    if not sources and original.get('source_ids'):
+        # A previous citation may still be relevant if topic-based retrieval
+        # missed it. Rehydrate evidence from the live database rather than
+        # trusting saved (possibly deleted or out-of-scope) source metadata.
+        with database() as conn:
+            sources = []
+            for chunk_id in original['source_ids']:
+                source = documents.source_for_chunk(conn, chunk_id)
+                if source and (not document_ids or source['document_id'] in document_ids):
+                    same_course = conn.execute(
+                        "SELECT 1 FROM documents WHERE id=? AND course_id=? AND status='ready'",
+                        (source['document_id'], job['course_id']),
+                    ).fetchone()
+                    if same_course:
+                        sources.append(source)
     # Generated citation IDs can only refer to evidence provided to the model.
     request = {
         'plan': plan.model_dump(),
-        'current_question': original,
+        # Saved citations are historical metadata, not new authorized evidence.
+        # Strip them so excluded/deleted document references cannot leak into
+        # the revision prompt through the prior question snapshot.
+        'current_question': {key: value for key, value in original.items()
+                             if key not in ('sources', 'source_ids')},
         'professor_instruction': instruction,
         'mode': 'regenerate' if regenerate else 'targeted_revision',
         'evidence': [{ 'id': s['chunk_id'], 'content': s['snippet'][:1100] } for s in sources],
