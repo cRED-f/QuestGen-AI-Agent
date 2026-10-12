@@ -100,7 +100,8 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
             approved_at REAL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
-            next_question TEXT
+            next_question TEXT,
+            pending_confirmation TEXT
         );
         CREATE TABLE IF NOT EXISTS exam_tool_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,6 +112,8 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
     ''')
     if 'next_question' not in {r['name'] for r in conn.execute('PRAGMA table_info(exam_sessions)')}:
         conn.execute('ALTER TABLE exam_sessions ADD COLUMN next_question TEXT')
+    if 'pending_confirmation' not in {r['name'] for r in conn.execute('PRAGMA table_info(exam_sessions)')}:
+        conn.execute('ALTER TABLE exam_sessions ADD COLUMN pending_confirmation TEXT')
 
 
 def read(conn: sqlite3.Connection, thread_id: str) -> dict | None:
@@ -120,6 +123,8 @@ def read(conn: sqlite3.Connection, thread_id: str) -> dict | None:
     result = dict(row)
     result['requirements'] = json.loads(result['requirements'])
     result['document_ids'] = json.loads(result['document_ids'])
+    result['pending_confirmation'] = (json.loads(result['pending_confirmation'])
+                                      if result.get('pending_confirmation') else None)
     result['missing'] = missing(result['requirements'], result['document_ids'])
     result['ready_for_approval'] = not result['missing']
     return result
@@ -177,7 +182,7 @@ def update(conn: sqlite3.Connection, thread_id: str, patch: RequirementsPatch,
     if document_ids is None:
         document_ids = session['document_ids']
     conn.execute('''UPDATE exam_sessions SET requirements=?, document_ids=?, status=?,
-        approved_at=NULL, next_question=NULL,updated_at=? WHERE thread_id=?''',
+        approved_at=NULL, next_question=NULL, pending_confirmation=NULL, updated_at=? WHERE thread_id=?''',
         (json.dumps(merged), json.dumps(document_ids),
          'awaiting_approval' if not missing(merged, document_ids) else 'collecting',
          time.time(), thread_id))
@@ -191,8 +196,8 @@ def approve(conn: sqlite3.Connection, thread_id: str) -> dict:
     if session['missing']:
         raise HTTPException(status_code=409, detail='Complete the requirements before approval: ' + ', '.join(session['missing']))
     stamp = time.time()
-    conn.execute("UPDATE exam_sessions SET status='approved', approved_at=?, updated_at=? WHERE thread_id=?",
-                 (stamp, stamp, thread_id))
+    conn.execute("UPDATE exam_sessions SET status='approved', approved_at=?, pending_confirmation=NULL, "
+                 "updated_at=? WHERE thread_id=?", (stamp, stamp, thread_id))
     return read(conn, thread_id)  # type: ignore[return-value]
 
 
@@ -221,3 +226,8 @@ def log_tool(conn: sqlite3.Connection, thread_id: str, name: str) -> None:
 def set_next_question(conn: sqlite3.Connection, thread_id: str, question: str) -> None:
     conn.execute('UPDATE exam_sessions SET next_question=? WHERE thread_id=?',
                  (question[:300],thread_id))
+
+def set_pending_confirmation(conn: sqlite3.Connection, thread_id: str, payload: dict | None) -> None:
+    """Hold an extracted-but-unconfirmed requirement set until the professor decides."""
+    conn.execute('UPDATE exam_sessions SET pending_confirmation=?, updated_at=? WHERE thread_id=?',
+                 (json.dumps(payload) if payload else None, time.time(), thread_id))

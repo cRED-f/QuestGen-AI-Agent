@@ -147,6 +147,23 @@ The existing bulk-generation endpoints remain available for older assessment job
 
 Run `PYTHONPATH=. pytest backend/tests -q` from the repository root to execute regression tests.
 
+## Exam Mode human-in-the-loop
+
+Requirements are collected one question at a time. When a chat message proposes a full
+requirement set, the server keeps only fields the professor actually stated (deterministic
+evidence gate), and a *completing* extraction is never saved silently: QuestGen summarizes
+it ("I heard: Midterm · 50 marks · 10 MCQ × 1…") and waits for an explicit yes. Approval
+and question generation are always separate professor actions.
+
+## Supervisor agent tools
+
+The blueprint supervisor and exam planner run as LangChain deepagents with read-only tools:
+custom `search_course_materials` / `inspect_slot_evidence`, plus `list_course_documents`
+and `read_document_chunks` (course-scoped file listing and bounded ordered excerpts).
+deepagents' virtual-FS tools (`ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`)
+are active by default inside the agent state; the `execute` tool, long-term memory, and
+web access are deliberately not enabled.
+
 ## Unified document ingestion, vision, and embeddings
 
 Document ingestion has **one** path: `backend/ingestion.py` combines trusted native-format parsing with optional **selected chat model** visual interpretation through `backend/vision.py`. Old `QUESTGEN_VISION_MODEL`, Tesseract OCR, and the embedded-picture-only PowerPoint extraction path have been removed. The model used for vision comes directly from **Model Settings** (including Ollama, OpenAI-compatible gateways, OpenRouter and native Anthropic Messages). The chosen model **must actually support image inputs**; merely being listed in model discovery does not establish that it does.

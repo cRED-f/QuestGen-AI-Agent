@@ -17,7 +17,7 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, Field, ValidationError, model_validator, field_validator
 
-from backend import documents
+from backend import course_tools, documents
 from backend.marks import to_cents
 
 MAX_QUESTIONS = 20
@@ -379,14 +379,17 @@ async def create_blueprint(job: dict, settings: dict) -> AssessmentBlueprint:
         "bloom_level, and marks. Total marks must equal their sum. "
         "Honor specified counts, marks, types, coverage, and difficulty. "
         "If unspecified, choose a modest sensible assessment and clearly focused topics. "
-        "Never invent citations. Do not write or execute files."
+        "Never invent citations. Do not write or execute files. "
+        "When ready-file evidence is needed, call list_course_documents first, "
+        "then read_document_chunks on the named file; never invent filenames."
     )
     # Checkpoints are job-scoped; they are not used to replay completed side-effecting
     # operations. Resume uses the durable assessment_jobs / questions records instead.
     checkpoint_path = ROOT / "data" / "deepagents-checkpoints.sqlite3"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
-        agent = create_deep_agent(model=model, tools=[search_course_materials],
+        agent = create_deep_agent(model=model,
+                                  tools=[search_course_materials, *course_tools.agent_tools(job["course_id"])],
                                   system_prompt=prompt, response_format=AssessmentBlueprint,
                                   checkpointer=saver)
         # Keep request and supporting data in one user message. Some compatible

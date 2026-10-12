@@ -24,6 +24,8 @@ export type ExamSession = {
   document_ids: string[];
   context_summary: string;
   next_question?: string | null;
+  /** Stashed extracted fields awaiting the professor's sign-off; dict, never render it directly. */
+  pending_confirmation?: Record<string, unknown> | null;
   missing: string[];
   ready_for_approval: boolean;
   updated_at?: number;
@@ -100,7 +102,7 @@ export default function ExamConfiguration({ session, documents, selectedDocument
   documents: CourseMaterial[];
   selectedDocuments: CourseMaterial[];
   busy: boolean;
-  onChoose: (updates: Partial<ExamRequirements>, answer: string, documentIds?: string[]) => Promise<boolean>;
+  onChoose: (updates: Partial<ExamRequirements>, answer: string, documentIds?: string[], confirm?: boolean) => Promise<boolean>;
   onSave: (updates: Partial<ExamRequirements>, documentIds?: string[]) => Promise<void>;
   onApprove: () => Promise<void>;
   onSelectMaterials: () => void;
@@ -159,6 +161,13 @@ export default function ExamConfiguration({ session, documents, selectedDocument
     <div className="qg-hitl-controls-inner">
       {approved ? children : ready ? (
         <button className="qg-exam-confirm-details" type="button" disabled={busy} onClick={() => void onApprove()}><Check size={15}/> Confirm exam details <ArrowRight size={14}/></button>
+      ) : session?.pending_confirmation ? (
+        <div className="qg-exam-control-step">
+          <div className="qg-exam-quick-replies" role="group" aria-label="Confirm extracted exam details">
+            <button type="button" disabled={busy} onClick={() => void onChoose({}, "Yes, save these", undefined, true)}>Yes, save these <ArrowRight size={13}/></button>
+            <button type="button" disabled={busy} onClick={() => void onChoose({}, "No, I'll rephrase", undefined, false)}>No, I'll rephrase <ArrowRight size={13}/></button>
+          </div>
+        </div>
       ) : (
         <div key={activeField || "intro"} className="qg-exam-control-step">
           {!!presets.length && <div className="qg-exam-quick-replies" role="group" aria-label="Suggested replies">

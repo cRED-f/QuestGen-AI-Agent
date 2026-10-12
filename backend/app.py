@@ -1088,6 +1088,8 @@ class ExamRequirementsInput(BaseModel):
 
 class ExamQuickReplyInput(ExamRequirementsInput):
     answer: str = Field(min_length=1, max_length=1500)
+    # Chip answers for a pending extracted-confirmation (True=save, False=discard).
+    confirm: bool | None = None
 
     @field_validator('answer')
     @classmethod
@@ -1157,15 +1159,46 @@ def quick_exam_reply(thread_id: str, data: ExamQuickReplyInput):
             exam_state.get_or_create(conn, thread_id, thread['course_id'],
                 context_summary=exam_tools.summarize_chat_context(conn, thread_id))
         updates = data.updates.model_dump(exclude_unset=True)
-        if not updates and data.document_ids is None:
+        if data.confirm is None and not updates and data.document_ids is None:
             raise HTTPException(status_code=422, detail='Select an exam answer before continuing')
-        session = exam_tools.save_exam_requirements(
-            conn, thread_id, thread['course_id'], updates, data.document_ids)
-        question = exam_tools.ask_professor(conn, thread_id)['question']
-        exam_state.set_next_question(conn,thread_id,question if session['missing'] else '')
-        session=exam_state.read(conn,thread_id)
+        pending_summary = None
+        if data.confirm is not None:
+            pending = (exam_state.read(conn, thread_id) or {}).get('pending_confirmation')
+            if data.confirm and pending:
+                session = exam_tools.save_exam_requirements(conn, thread_id, thread['course_id'], pending)
+            else:
+                session = exam_state.read(conn, thread_id)
+            exam_state.set_pending_confirmation(conn, thread_id, None)
+        else:
+            before = exam_state.read(conn, thread_id) or {}
+            merged = {**before.get('requirements', {}),
+                      **{k: v for k, v in updates.items() if v is not None}}
+            doc_ids = data.document_ids if data.document_ids is not None else before.get('document_ids', [])
+            if (updates and before.get('status') != 'approved'
+                    and not exam_state.missing(merged, doc_ids)):
+                # The last pre-set answer completes the setup: that moment always
+                # lands on an explicit "I heard: … save these?" sign-off turn.
+                exam_state.set_pending_confirmation(conn, thread_id, updates)
+                pending_summary = exam_agent._confirmation_summary(updates)
+            else:
+                session = exam_tools.save_exam_requirements(
+                    conn, thread_id, thread['course_id'], updates, data.document_ids)
+        if pending_summary is not None:
+            exam_state.set_next_question(conn, thread_id, pending_summary)
+            session = exam_state.read(conn, thread_id)
+            question = pending_summary
+            reply = pending_summary
+        else:
+            question = exam_tools.ask_professor(conn, thread_id)['question']
+            exam_state.set_next_question(conn,thread_id,question if session['missing'] else '')
+            session=exam_state.read(conn,thread_id)
         if session['status'] == 'approved':
             reply = 'Your exam setup is approved. We can now prepare the question-paper blueprint.'
+        elif data.confirm is True:
+            reply = (('Saved your exam details. ' + question) if session['missing']
+                     else 'I have everything needed. Review your exam details and confirm them to continue.')
+        elif data.confirm is False:
+            reply = 'Understood — I discarded those details. ' + question
         elif not session['missing']:
             reply = 'I have everything needed. Review your exam details and confirm them to continue.'
         else:

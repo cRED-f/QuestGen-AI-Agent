@@ -841,7 +841,7 @@ export default function ChatPage() {
     finally { setExamBusy(false); }
   };
 
-  const submitExamQuickReply = async (updates: Partial<ExamRequirements>, answer: string, documentIds?: string[]) => {
+  const submitExamQuickReply = async (updates: Partial<ExamRequirements>, answer: string, documentIds?: string[], confirm?: boolean) => {
     if (!threadId || examBusy || busy || !examIntroConfirmed) return false;
     setExamBusy(true);
     setError("");
@@ -849,7 +849,7 @@ export default function ChatPage() {
       const result = await requestJson<{user_id: string; message_id: string; reply: string; session: ExamSession}>(
         `/threads/${threadId}/exam/quick-reply`, {
           method: "POST",
-          body: JSON.stringify({updates, answer, ...(documentIds ? {document_ids: documentIds} : {})}),
+          body: JSON.stringify({updates, answer, ...(documentIds ? {document_ids: documentIds} : {}), ...(confirm === undefined ? {} : {confirm})}),
         });
       setExamSession(result.session);
       setExamPaper(null);
