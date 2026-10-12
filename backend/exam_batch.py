@@ -44,7 +44,7 @@ class BatchResponse(BaseModel):
 
 class DraftChoice(BaseModel):
     draft_id: str
-    decision: Literal['keep', 'revise']
+    decision: Literal['pending', 'keep', 'revise']
     version: int = Field(ge=1)
 
 

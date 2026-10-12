@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Check, ChevronDown, Loader2, PenLine, RefreshCw, SkipForward } from "lucide-react";
+import { Check, CheckCircle2, ChevronDown, ClipboardList, Loader2, PenLine, RefreshCw, SkipForward, Sparkles } from "lucide-react";
 import type { ExamRequirements } from "@/components/workspace/ExamConfiguration";
 import ExamChoiceSelect from "@/components/workspace/ExamChoiceSelect";
 import FormattedMessage from "@/components/workspace/FormattedMessage";
@@ -44,15 +44,14 @@ export function QuestionFields({ initial, onSave, onCancel, busy }: {
 
 export default function ExamPaperBuilder({ paper, requirements, busy, reasoning, onPrepare, onChangeBlueprint, onApproveBlueprint,
   onNext, onAccept, onRegenerate, onSkip, onEditCandidate, onCancelGeneration,
-  onBatch, onReviseBatch, onChooseDraft, onEditDraft, onApproveDrafts }: {
+  onBatch, onChooseDraft, onEditDraft, onApproveDrafts }: {
   paper: ExamPaper | null; requirements: ExamRequirements; busy: boolean; reasoning?: string;
   onPrepare: () => Promise<void>; onChangeBlueprint: (blueprint: PaperBlueprint) => Promise<void>;
   onApproveBlueprint: () => Promise<void>; onNext: () => Promise<void>;
   onAccept: () => Promise<void>; onRegenerate: () => Promise<void>; onSkip: () => Promise<void>;
   onEditCandidate: (changes: QuestionEdits) => Promise<void>; onCancelGeneration: () => Promise<void>;
   onBatch: () => Promise<void>;
-  onReviseBatch: (ids: string[], instructions: string) => Promise<void>;
-  onChooseDraft: (id: string, decision: "keep" | "revise", version: number) => Promise<void>;
+  onChooseDraft: (id: string, decision: "pending" | "keep" | "revise", version: number) => Promise<void>;
   onEditDraft: (id: string, version: number, changes: QuestionEdits) => Promise<void>;
   onApproveDrafts: (drafts: {id: string; version: number}[]) => Promise<void>;
 
@@ -60,7 +59,6 @@ export default function ExamPaperBuilder({ paper, requirements, busy, reasoning,
   const [blueprint, setBlueprint] = useState<PaperBlueprint | null>(null);
   const [editingCandidate, setEditingCandidate] = useState(false);
   const [editingDraft, setEditingDraft] = useState<string | null>(null);
-  const [revisionInstructions, setRevisionInstructions] = useState("");
   useEffect(() => { if (paper) setBlueprint(paper.blueprint); setEditingCandidate(false); }, [paper?.updated_at, paper?.thread_id]);
   if (!paper || paper.stale) return <section className="qg-builder" aria-label="Prepare exam paper">
     <div className="qg-builder-heading"><h2>Build your exam paper</h2><p>Your configuration is approved. Prepare a blueprint and review its topics before generating questions.</p></div>
@@ -88,19 +86,35 @@ export default function ExamPaperBuilder({ paper, requirements, busy, reasoning,
   const kept = drafts.filter(draft => draft.decision === "keep");
   const flagged = drafts.filter(draft => draft.decision === "revise");
   const unfilled = paper.total_questions - paper.questions.length - drafts.length;
-  if (!candidate && (drafts.length > 0 || paper.status === "generating" || paper.status === "ready") && paper.status !== "complete") return <section className="qg-builder" aria-label="Review generated exam">
-    <div className="qg-builder-heading"><span className="qg-overline">CONTEXT-ENGINEERED EXAM STUDIO</span><h2>Review the complete exam draft</h2>
-      <p>{paper.questions.length} approved · {drafts.length} drafts · {Math.max(0,unfilled)} to generate. Question complexity is inferred unless you specify it.</p></div>
-    {paper.status === "generating" && <div className="qg-generation-status" role="status"><Loader2 className="qg-spin" size={16}/> Generating your question batch… Valid drafts are saved as they finish.
-      <button type="button" onClick={() => void onCancelGeneration()}>Cancel generation</button>
-      {reasoning && <details className="qg-reasoning" open><summary>Model thinking</summary><div className="qg-reasoning-body">{reasoning}</div></details>}</div>}
-    {unfilled > 0 && paper.status !== "generating" && <button className="qg-paper-primary" type="button" disabled={busy} onClick={() => void onBatch()}>
-      {busy ? <Loader2 className="qg-spin" size={16}/> : <PenLine size={16}/>} Generate {unfilled} questions in a batch</button>}
+  const generatedCount = paper.questions.length + drafts.length;
+  const progress = paper.total_questions ? Math.min(100, (generatedCount / paper.total_questions) * 100) : 0;
+  const questionLabel = (count: number) => `${count} ${count === 1 ? "question" : "questions"}`;
+  if (!candidate && (drafts.length > 0 || paper.status === "generating" || paper.status === "ready") && paper.status !== "complete") return <section className="qg-builder qg-builder--batch" aria-label="Review generated exam">
+    <div className="qg-builder-heading qg-builder-heading--studio">
+      <span className="qg-builder-symbol" aria-hidden="true"><ClipboardList size={19}/></span>
+      <div className="qg-builder-heading-copy"><span className="qg-overline">EXAM STUDIO / QUESTION REVIEW</span><h2>Shape your question paper</h2>
+        <p>Review each question, keep what works, and flag anything you want to improve.</p></div>
+    </div>
+    <div className="qg-review-progress" aria-label="Question generation progress">
+      <div className="qg-review-progress-heading"><strong>{generatedCount} <span>/ {paper.total_questions} questions drafted or approved</span></strong><span>{Math.round(progress)}% ready</span></div>
+      <div className="qg-review-progress-track" role="progressbar" aria-valuenow={generatedCount} aria-valuemin={0} aria-valuemax={paper.total_questions} aria-label="Generated or approved questions"><span style={{width: `${progress}%`}}/></div>
+      <div className="qg-review-metrics"><span><CheckCircle2 size={13}/> {questionLabel(paper.questions.length)} approved</span><span><ClipboardList size={13}/> {questionLabel(drafts.length)} to review</span><span>{Math.max(0,unfilled)} remaining</span></div>
+    </div>
+    {paper.status === "generating" && <div className="qg-generation-status qg-generation-status--batch" role="status">
+      <span className="qg-generation-status-icon"><Loader2 className="qg-spin" size={16}/></span>
+      <div><strong>Creating your questions</strong><p>Completed questions are saved as they arrive.</p></div>
+      <button type="button" onClick={() => void onCancelGeneration()}>Cancel</button>
+      {reasoning && <details className="qg-reasoning"><summary>Show model thinking</summary><div className="qg-reasoning-body">{reasoning}</div></details>}
+    </div>}
+    {unfilled > 0 && paper.status !== "generating" && <button className="qg-paper-primary qg-batch-generate" type="button" disabled={busy} onClick={() => void onBatch()}>
+      {busy ? <Loader2 className="qg-spin" size={16}/> : <Sparkles size={16}/>} Generate {questionLabel(unfilled)} <span aria-hidden="true">→</span></button>}
     {drafts.length > 0 && <>
-      <div className="qg-paper-actions"><strong>{kept.length} keep · {flagged.length} revise · {drafts.length - kept.length - flagged.length} undecided</strong>
-        <button type="button" disabled={busy || kept.length === 0 || paper.status === "generating"} onClick={() => void onApproveDrafts(kept.map(d => ({id:d.id, version:d.version})))}><Check size={15}/> Approve {kept.length} kept</button></div>
-      <div className="qg-batch-drafts">{drafts.map(draft => <article key={draft.id} className="qg-batch-draft">
-        <div className="qg-candidate-meta"><strong>Question {draft.slot} · {draft.content.kind.replaceAll("_", " ")}</strong><span>{draft.content.marks} marks · {draft.content.difficulty} · {draft.content.topic}</span></div>
+      <div className="qg-review-toolbar"><div><strong>Question review</strong><span>{kept.length} to keep · {flagged.length} to revise · {drafts.length - kept.length - flagged.length} undecided</span></div>
+        <button className="qg-review-approve" type="button" disabled={busy || kept.length === 0 || paper.status === "generating"} onClick={() => void onApproveDrafts(kept.map(d => ({id:d.id, version:d.version})))}><Check size={14}/> Approve {kept.length} kept</button></div>
+      {flagged.length > 0 && <div className="qg-review-revision-hint" role="status"><RefreshCw size={16}/><p><strong>{questionLabel(flagged.length)} selected for revision.</strong> Describe the changes in the highlighted message box below, then press Enter.</p></div>}
+      <div className="qg-batch-drafts">{drafts.map(draft => <article key={draft.id} className={`qg-batch-draft ${draft.decision === "revise" ? "qg-batch-draft--revise" : draft.decision === "keep" ? "qg-batch-draft--keep" : ""}`}>
+        <div className="qg-candidate-meta"><span className="qg-draft-number">Q{draft.slot}</span><div><strong>{draft.content.kind.replaceAll("_", " ")}</strong><span>{draft.content.marks} marks · {draft.content.difficulty} · {draft.content.topic}</span></div>
+          <span className={`qg-draft-status qg-draft-status--${draft.decision}`}>{draft.decision === "revise" ? "Selected to revise" : draft.decision === "keep" ? "Ready to keep" : "Needs review"}</span></div>
         {editingDraft === draft.id ? <QuestionFields initial={draft.content} busy={busy}
           onSave={async changes => { await onEditDraft(draft.id, draft.version, changes); setEditingDraft(null); }} onCancel={() => setEditingDraft(null)}/> : <>
           <div className="qg-question-rich questgen-prose"><FormattedMessage content={draft.content.stem}/></div>
@@ -108,15 +122,13 @@ export default function ExamPaperBuilder({ paper, requirements, busy, reasoning,
           <details className="qg-candidate-answer"><summary>Suggested answer, explanation and evidence <ChevronDown size={14}/></summary>
             <p><strong>Answer:</strong> {draft.content.correct_answer}</p><p>{draft.content.explanation}</p>
             <p>{draft.content.grounded ? `${draft.content.source_ids?.length || 0} cited source(s)` : "No citation; verify academic accuracy"}</p></details>
-          <div className="qg-paper-actions"><button type="button" className={draft.decision === "keep" ? "qg-paper-primary" : ""} disabled={busy || paper.status === "generating"} onClick={() => void onChooseDraft(draft.id, "keep", draft.version)}><Check size={14}/> Keep</button>
-            <button type="button" aria-pressed={draft.decision === "revise"} disabled={busy || paper.status === "generating"} onClick={() => void onChooseDraft(draft.id, "revise", draft.version)}><RefreshCw size={14}/> Revise</button>
-            <button type="button" disabled={busy || paper.status === "generating"} onClick={() => setEditingDraft(draft.id)}><PenLine size={14}/> Edit</button></div>
+          <div className="qg-paper-actions qg-draft-actions"><button type="button" aria-pressed={draft.decision === "keep"} className={draft.decision === "keep" ? "qg-draft-action--active" : ""} disabled={busy || paper.status === "generating"} onClick={() => void onChooseDraft(draft.id, "keep", draft.version)}><Check size={14}/> Keep</button>
+            <button type="button" aria-pressed={draft.decision === "revise"} className={draft.decision === "revise" ? "qg-draft-action--active" : ""} disabled={busy || paper.status === "generating"} onClick={() => void onChooseDraft(draft.id, draft.decision === "revise" ? "pending" : "revise", draft.version)}><RefreshCw size={14}/> Revise</button>
+            <button type="button" disabled={busy || paper.status === "generating"} onClick={() => setEditingDraft(draft.id)}><PenLine size={14}/> Edit manually</button></div>
         </>}
       </article>)}</div>
-      {flagged.length > 0 && <div className="qg-batch-revision"><label>How should the selected questions change? (Optional)<textarea value={revisionInstructions} maxLength={1200} onChange={e => setRevisionInstructions(e.target.value)} placeholder="Example: Make these more analytical and change the numerical examples."/></label>
-        <button className="qg-paper-primary" type="button" disabled={busy || paper.status === "generating"} onClick={() => void onReviseBatch(flagged.map(d => d.id), revisionInstructions)}><RefreshCw size={15}/> Regenerate only {flagged.length} flagged question(s)</button></div>}
     </>}
-    {paper.questions.length > 0 && <p className="qg-paper-done">Approved questions are stored separately and will not be overwritten by batch revision. Review them in the paper sidebar.</p>}
+    {paper.questions.length > 0 && <p className="qg-paper-done">Approved questions are protected from batch revision. Review them in the paper sidebar.</p>}
     {requirements.material_scope === "general" && <p className="qg-paper-warning">General knowledge mode: answers need independent academic verification.</p>}
   </section>;
   return <section className="qg-builder" aria-label="Generate questions">

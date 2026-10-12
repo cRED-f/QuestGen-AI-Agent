@@ -104,6 +104,31 @@ def test_batch_mixed_formats_inferred_complexity_and_selective_revision(client,m
     assert done.json()['drafts']==[]
 
 
+def test_selected_draft_revision_can_be_cleared_without_marking_it_kept(client, monkeypatch):
+    base = setup(client, monkeypatch)
+    async def fake(settings, system, request, *, max_tokens, on_reasoning=None):
+        return model_response(request)
+    monkeypatch.setattr(generation, 'model_json', fake)
+    response = client.post(base + '/generation/start', json={'mode': 'batch'})
+    result = wait(client, base, response.json()['request_id'])
+    assert result['status'] == 'succeeded'
+    draft = result['paper']['drafts'][0]
+    choice = {'draft_id': draft['id'], 'version': draft['version']}
+    flagged = client.put(base + '/drafts/decision', json={**choice, 'decision': 'revise'})
+    assert flagged.status_code == 200
+    assert next(d for d in flagged.json()['drafts'] if d['id'] == draft['id'])['decision'] == 'revise'
+    cleared = client.put(base + '/drafts/decision', json={**choice, 'decision': 'pending'})
+    assert cleared.status_code == 200
+    cleared_draft = next(d for d in cleared.json()['drafts'] if d['id'] == draft['id'])
+    assert cleared_draft['decision'] == 'pending'
+    assert cleared_draft['version'] == draft['version']
+    # A cleared selection cannot be revised unless explicitly re-flagged.
+    rejected = client.post(base + '/generation/start', json={
+        'mode': 'revision', 'draft_ids': [draft['id']], 'instructions': 'More analytical',
+    })
+    assert rejected.status_code == 409
+
+
 def test_failed_large_output_falls_back_to_sub_batched_generation(client,monkeypatch):
     base=setup(client,monkeypatch)
     sizes=[]

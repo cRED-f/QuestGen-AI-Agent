@@ -249,6 +249,7 @@ export default function ChatPage() {
   const [deletingCourse, setDeletingCourse] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [input, setInput] = useState("");
+  const [revisionInput, setRevisionInput] = useState("");
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [copyFeedback, setCopyFeedback] = useState<{ id: string; status: "copied" | "error" } | null>(null);
   const copyFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -282,6 +283,21 @@ export default function ChatPage() {
     document.documentElement.style.colorScheme = next;
     window.localStorage.setItem("questgen:theme", next);
   };
+
+  // A flagged draft turns the existing composer into a targeted revision input.
+  // Its text is independent from the regular chat draft, so selection never
+  // discards anything the professor was already typing.
+  const revisionTargets = workspaceMode === "exam" && examIntroConfirmed && examSession?.status === "approved"
+    && examPaper && examPaper.status !== "complete" && !examPaper.candidate
+    ? examPaper.drafts.filter(draft => draft.decision === "revise") : [];
+  const revisingSelection = revisionTargets.length > 0 && !editingMessageId;
+  const composerText = revisingSelection ? revisionInput : input;
+  useEffect(() => { setRevisionInput(""); }, [threadId]);
+  const revisionSelectionKey = revisionTargets.map(draft => draft.id).join(":");
+  useEffect(() => {
+    if (revisionSelectionKey) textRef.current?.focus();
+    else setRevisionInput("");
+  }, [revisionSelectionKey]);
 
   const currentCourse = courses.find((course) => course.id === courseId);
   const currentThread = threads.find((thread) => thread.id === threadId);
@@ -677,7 +693,7 @@ export default function ChatPage() {
     return () => { active = false; clearInterval(timer); };
   }, [threadId, workspaceMode, examPaper?.status, paperBusy, refreshExamPaper]);
 
-  const paperAction = async (path: string, method: string = "POST", body?: unknown) => {
+  const paperAction = async (path: string, method: string = "POST", body?: unknown, onSuccess?: () => void) => {
     if (!threadId || paperBusy || examBusy) return;
     setPaperBusy(true);
     setError("");
@@ -723,7 +739,7 @@ export default function ChatPage() {
           );
           if (abort?.signal.aborted) break;
           if (status.paper) setExamPaper(status.paper);
-          if (status.status === "succeeded") break;
+          if (status.status === "succeeded") { onSuccess?.(); break; }
           if (status.status === "cancelled") break;
           if (status.status === "failed") {
             throw new Error(status.error || "Question generation failed. Check the FastAPI terminal.");
@@ -734,6 +750,7 @@ export default function ChatPage() {
           method, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         });
         setExamPaper(paper);
+        onSuccess?.();
       }
     } catch (cause) {
       if (!(abort?.signal.aborted)) setError(cause instanceof Error ? cause.message : "Could not update exam paper.");
@@ -1294,6 +1311,15 @@ export default function ChatPage() {
   };
 
   const sendFromComposer = () => {
+    if (revisingSelection) {
+      if (paperBusy || examBusy || busy || !threadId) return;
+      // The server checks that every ID is still flagged before regenerating;
+      // this instruction must not enter the normal chat-turn handler.
+      void paperAction("/batch/revise", "POST", {
+        draft_ids: revisionTargets.map(draft => draft.id), instructions: revisionInput.trim(),
+      }, () => setRevisionInput(""));
+      return;
+    }
     void send(input, editingMessageId ? { edit_message_id: editingMessageId } : undefined);
   };
   const onSubmit = (event: FormEvent) => { event.preventDefault(); sendFromComposer(); };
@@ -1605,7 +1631,6 @@ export default function ChatPage() {
                   onSkip={() => paperAction("/skip", "POST", { candidate_id: examPaper?.candidate_id })}
                   onEditCandidate={(changes: QuestionEdits) => paperAction("/candidate", "PATCH", { candidate_id: examPaper?.candidate_id, ...changes })}
                   onBatch={() => paperAction("/batch")}
-                  onReviseBatch={(draft_ids, instructions) => paperAction("/batch/revise", "POST", {draft_ids, instructions})}
                   onChooseDraft={(draft_id, decision, version) => paperAction("/drafts/decision", "PUT", {draft_id,decision,version})}
                   onEditDraft={(draft_id, version, changes) => paperAction(`/drafts/${draft_id}`, "PATCH", {version,...changes})}
                   onApproveDrafts={(drafts) => paperAction("/drafts/approve", "POST", {
@@ -1616,7 +1641,7 @@ export default function ChatPage() {
                 />}
               </ExamConfiguration>}
               {workspaceMode === "exam" && <div ref={setHitlActionsTarget} className="qg-hitl-composer-actions" aria-label="Exam choices and question controls"/>}
-              <form className={`qg-composer ${editingMessageId ? "qg-composer--editing" : ""}`} onSubmit={onSubmit}>
+              <form className={`qg-composer ${editingMessageId ? "qg-composer--editing" : ""} ${revisingSelection ? "qg-composer--revision" : ""}`} onSubmit={onSubmit}>
                 <div className="qg-composer-topline"><span>{editingMessageId ? "EDIT MESSAGE" : "YOUR NEXT THOUGHT"}</span><span className="qg-compose-line"/></div>
                 {editingMessageId && (
                   <div className="qg-composer-edit-banner" role="status">
@@ -1624,7 +1649,16 @@ export default function ChatPage() {
                     <button type="button" onClick={cancelMessageEdit} disabled={busy} aria-label="Cancel message editing"><X size={14}/> Cancel</button>
                   </div>
                 )}
-                {!editingMessageId && <div className="qg-compose-scope" role="status">
+                {revisingSelection && <div className="qg-revision-compose-context" role="status">
+                  <span className="qg-revision-compose-icon"><RefreshCw size={16}/></span>
+                  <div className="qg-revision-compose-detail"><strong>Revise {revisionTargets.length} selected {revisionTargets.length === 1 ? "question" : "questions"}</strong>
+                    <span>Your message will regenerate only these questions.</span>
+                    <div className="qg-revision-compose-tags" aria-label="Selected question numbers">
+                      {revisionTargets.slice(0, 6).map(draft => <span key={draft.id}>Q{draft.slot}</span>)}
+                      {revisionTargets.length > 6 && <span>+{revisionTargets.length - 6} more</span>}
+                    </div></div>
+                </div>}
+                {!editingMessageId && !revisingSelection && <div className="qg-compose-scope" role="status">
                   {attachedDocuments.length > 0
                     ? `Using ${attachedDocuments.length} selected ${attachedDocuments.length === 1 ? "material" : "materials"} for this conversation`
                     : libraryDocuments.some((doc) => doc.status === "ready")
@@ -1636,25 +1670,25 @@ export default function ChatPage() {
                 {attachedDocuments.length > 0 && <div className="qg-attached-list" aria-label="Attached course materials">
                   {attachedDocuments.map((doc) => <span key={doc.id} className="qg-attached-chip"><Files size={13}/><span title={doc.filename}>{doc.filename}</span><button type="button" aria-label={`Remove ${doc.filename}`} onClick={() => setAttachedDocuments((old) => old.filter((item) => item.id !== doc.id))}><X size={13}/></button></span>)}
                 </div>}
-                <textarea ref={textRef} rows={1} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || examBusy || !courseId || (workspaceMode === "chat" && !settings.model)} aria-label={editingMessageId ? "Edit message in composer" : "Message QuestGen"} placeholder={workspaceMode === "exam" ? "Answer the current question, or tell me your exam requirements…" : !settings.model ? "Choose a model in the top bar to begin…" : "Ask a question, learn, or discuss any topic…"}/>
+                <textarea ref={textRef} rows={1} maxLength={revisingSelection ? 1200 : 12000} value={composerText} onChange={(event) => revisingSelection ? setRevisionInput(event.target.value) : setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || examBusy || (revisingSelection && paperBusy) || !courseId || (workspaceMode === "chat" && !settings.model)} aria-label={editingMessageId ? "Edit message in composer" : revisingSelection ? "Instructions for selected questions" : "Message QuestGen"} placeholder={revisingSelection ? "Describe what to change — e.g. make Q3 more analytical, use a different example… (optional)" : workspaceMode === "exam" ? "Answer the current question, or tell me your exam requirements…" : !settings.model ? "Choose a model in the top bar to begin…" : "Ask a question, learn, or discuss any topic…"}/>
                 <div className="qg-composer-actions">
                   {editingMessageId ? (
                     <span className="qg-edit-help">Enter to save · Shift+Enter for new line · Esc to cancel</span>
                   ) : (
                     <>
-                      <button type="button" onClick={() => openLibrary("picker")} disabled={!courseId} className="qg-attach"><Paperclip size={17}/><span>Attach course material</span></button>
-                      <span className="qg-keyboard-tip">↵ to send · shift ↵ for new line</span>
+                      {!revisingSelection && <button type="button" onClick={() => openLibrary("picker")} disabled={!courseId} className="qg-attach"><Paperclip size={17}/><span>Attach course material</span></button>}
+                      <span className="qg-keyboard-tip">{revisingSelection ? "↵ revise selected · shift ↵ for new line" : "↵ to send · shift ↵ for new line"}</span>
                       {workspaceMode === "exam" && assessment?.status === "completed" && !examPaper && <button type="button" className="qg-assessment-action" onClick={() => void customizeAssessment()}
                         disabled={!input.trim() || busy || startingExam || editingQuestionId !== null} title="Apply conversational edits to question(s) in this assessment">
                         <PencilLine size={15}/> Apply to draft
                       </button>}
-                      {workspaceMode === "exam" && <span className="qg-exam-gate-hint"><ShieldCheck size={14}/> {examSession?.status === "approved" ? "Configuration approved · review the blueprint to generate questions" : "Professor approval required"}</span>}
+                      {workspaceMode === "exam" && !revisingSelection && <span className="qg-exam-gate-hint"><ShieldCheck size={14}/> {examSession?.status === "approved" ? "Configuration approved · review the blueprint to generate questions" : "Professor approval required"}</span>}
                     </>
                   )}
                   {busy ? (
                     <button type="button" onClick={() => abortRef.current?.abort()} className="qg-send" title="Stop response" aria-label="Stop response"><Square size={15} fill="currentColor"/></button>
                   ) : (
-                    <button type="submit" disabled={!input.trim() || !courseId || examBusy || (workspaceMode === "chat" && !settings.model)} className="qg-send" aria-label={editingMessageId ? "Save edit and regenerate response" : "Send message"} title={editingMessageId ? "Save edit & regenerate" : "Send message"}>{editingMessageId ? <Check size={20}/> : <ArrowUp size={21}/>}</button>
+                    <button type="submit" disabled={(!revisingSelection && !input.trim()) || !courseId || examBusy || (revisingSelection && paperBusy) || (workspaceMode === "chat" && !settings.model)} className="qg-send" aria-label={editingMessageId ? "Save edit and regenerate response" : revisingSelection ? "Regenerate selected questions" : "Send message"} title={editingMessageId ? "Save edit & regenerate" : revisingSelection ? "Revise selected questions" : "Send message"}>{editingMessageId ? <Check size={20}/> : revisingSelection ? <RefreshCw size={19}/> : <ArrowUp size={21}/>}</button>
                   )}
                 </div>
               </form>
