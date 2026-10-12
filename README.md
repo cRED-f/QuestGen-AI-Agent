@@ -2,7 +2,7 @@
 
 **A chat-based assessment workspace for professors.**
 
-QuestGen lets you organize course materials, discuss them with an AI assistant, draft an assessment, revise individual questions, review and approve the results, and export student or instructor copies. Its interface uses a paper-and-pencil-inspired design rather than a landing-page-first workflow.
+QuestGen lets you organize course materials, discuss them with an AI assistant, draft an assessment, revise individual questions, review and approve the results, and export student or instructor copies.
 
 > **Status:** Active development.
 
