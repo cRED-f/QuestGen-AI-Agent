@@ -19,6 +19,7 @@ import {
   Check,
   Loader2,
   ClipboardList,
+  Copy,
   RotateCcw,
   CheckCircle2,
   Menu,
@@ -30,7 +31,8 @@ import {
   X,
 } from "lucide-react";
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import FormattedMessage from "@/components/workspace/FormattedMessage";
+import { writeMessageToClipboard } from "@/lib/clipboard";
 import { DocumentPanel, type CourseMaterial, Source, sourceLink, sourceLocation } from "@/components/workspace/DocumentPanel";
 import QuestionEditor, { type AssessmentQuestion } from "@/components/workspace/QuestionEditor";
 import PencilSelect from "@/components/workspace/PencilSelect";
@@ -187,9 +189,16 @@ export default function ChatPage() {
   const [attachedDocuments, setAttachedDocuments] = useState<CourseMaterial[]>([]);
   const [courseOpen, setCourseOpen] = useState(false);
   const [courseName, setCourseName] = useState("");
+  const [courseToDelete, setCourseToDelete] = useState<Course | null>(null);
+  const [deleteConfirmName, setDeleteConfirmName] = useState("");
+  const [courseDeleteError, setCourseDeleteError] = useState("");
+  const [deletingCourse, setDeletingCourse] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [input, setInput] = useState("");
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [copyFeedback, setCopyFeedback] = useState<{ id: string; status: "copied" | "error" } | null>(null);
+  const copyFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyAttemptRef = useRef(0);
   const [deletingThreadId, setDeletingThreadId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -203,6 +212,26 @@ export default function ChatPage() {
   const activeCourseRef = useRef("");
   const currentCourse = courses.find((course) => course.id === courseId);
   const currentThread = threads.find((thread) => thread.id === threadId);
+
+  useEffect(() => () => {
+    if (copyFeedbackTimerRef.current !== null) clearTimeout(copyFeedbackTimerRef.current);
+  }, []);
+
+  const copyChatMessage = async (message: ChatMessage) => {
+    if (!message.content.trim()) return;
+    const attempt = ++copyAttemptRef.current;
+    let status: "copied" | "error" = "copied";
+    try {
+      await writeMessageToClipboard(message.content);
+    } catch {
+      status = "error";
+    }
+    // Ignore an earlier copy attempt that resolves after the latest one.
+    if (attempt !== copyAttemptRef.current) return;
+    if (copyFeedbackTimerRef.current !== null) clearTimeout(copyFeedbackTimerRef.current);
+    setCopyFeedback({ id: message.id, status });
+    copyFeedbackTimerRef.current = setTimeout(() => setCopyFeedback(null), 2200);
+  };
 
   const refreshLibrary = useCallback(async (id: string) => {
     const data = await requestJson<CourseMaterial[]>(`/courses/${encodeURIComponent(id)}/documents`);
@@ -350,6 +379,14 @@ export default function ChatPage() {
     }
   }, [messages, busy]);
 
+  // Stay one line when empty, but grow naturally for longer prompts and edits.
+  useEffect(() => {
+    const textarea = textRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, Math.min(142, window.innerHeight * 0.25))}px`;
+  }, [input]);
+
   useEffect(() => () => abortRef.current?.abort(), []);
 
   useEffect(() => {
@@ -428,6 +465,44 @@ export default function ChatPage() {
       setError(cause instanceof Error ? cause.message : "Could not create course.");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const confirmDeleteCourse = async () => {
+    if (!courseToDelete || deleteConfirmName !== courseToDelete.name || deletingCourse || busy) return;
+    const target = courseToDelete;
+    setDeletingCourse(true);
+    setCourseDeleteError("");
+    try {
+      await requestJson<void>(`/courses/${encodeURIComponent(target.id)}`, { method: "DELETE" });
+      window.localStorage.removeItem(`questgen:thread:${target.id}`);
+      const remaining = courses.filter((item) => item.id !== target.id);
+      setCourses(remaining);
+      if (courseId === target.id) {
+        const nextId = remaining[0]?.id || "";
+        activeCourseRef.current = nextId;
+        setCourseId(nextId);
+        setThreadId(null);
+        setThreads([]);
+        setMessages([]);
+        setLibraryDocuments([]);
+        setAttachedDocuments([]);
+        savedAttachmentsRef.current = [];
+        setAssessment(null);
+        setActivities([]);
+        setEditingMessageId(null);
+        setInput("");
+        setDocumentsOpen(false);
+        if (!nextId) window.localStorage.removeItem("questgen:course");
+        else window.localStorage.setItem("questgen:course", nextId);
+      }
+      setCourseToDelete(null);
+      setDeleteConfirmName("");
+      setError("");
+    } catch (cause) {
+      setCourseDeleteError(cause instanceof Error ? cause.message : "Could not delete the course.");
+    } finally {
+      setDeletingCourse(false);
     }
   };
 
@@ -605,7 +680,8 @@ export default function ChatPage() {
     } finally {
       abortRef.current = null;
       setBusy(false);
-      if (!action && !controller.signal.aborted) setAttachedDocuments([]);
+      // Preserve chosen source files for follow-up turns in this conversation.
+      // Without a selection, the backend automatically uses the ready course library.
       if (editWasAccepted) {
         setEditingMessageId(null);
         setInput(savedComposerDraftRef.current);
@@ -674,7 +750,7 @@ export default function ChatPage() {
       setAssessment(job);
       setActivities(job.events || []);
       setInput("");
-      setAttachedDocuments([]);
+      // Keep the document scope when the professor follows up on this exam.
       setShowAnswers(false);
       await refreshThreads(courseId);
     } catch (cause) {
@@ -793,7 +869,9 @@ export default function ChatPage() {
             </div>
             <PencilSelect ariaLabel="Your course" placement="sidebar" value={courseId} disabled={busy}
               options={courses.map((course) => ({ value: course.id, label: course.name }))}
-              onChange={setCourseId} placeholder="Choose a course"/>
+              onChange={setCourseId} placeholder="Choose a course"
+              onDeleteOption={(id) => { setCourseToDelete(courses.find((item) => item.id === id) || null); setDeleteConfirmName(""); setCourseDeleteError(""); setSidebarOpen(false); }}
+              deletingOption={deletingCourse ? courseToDelete?.id : null}/>
           </div>
 
           <div className="qg-side-section qg-library-section">
@@ -898,24 +976,45 @@ export default function ChatPage() {
                           </>
                         ) : (
                           <div className="qg-assistant-text questgen-prose">
-                            {message.content ? <ReactMarkdown>{message.content}</ReactMarkdown> : <span className="qg-thinking"><Loader2 size={15} className="qg-spin"/> Thinking through your question…</span>}
+                            {message.content ? <FormattedMessage content={message.content}/> : <span className="qg-thinking"><Loader2 size={15} className="qg-spin"/> Thinking through your question…</span>}
                             {!!message.sources?.length && (
                               <div className="qg-citations">
                                 <div className="qg-citations-title"><BookOpenText size={15}/> REFERENCED MATERIAL</div>
                                 <div className="qg-citation-list">
-                                  {message.sources.map((source, index) => (
+                                  {message.sources.slice(0, 8).map((source, index) => (
                                     <a key={source.chunk_id} className="qg-citation" href={sourceLink(source)} target="_blank" rel="noopener noreferrer" title={source.snippet.slice(0, 400)}>
                                       <span>{index + 1}</span> {source.filename}{source.page ? ` · ${sourceLocation(source)}` : ""}{source.section ? ` · ${source.section}` : ""}<ArrowUpRight size={13}/>
                                     </a>
                                   ))}
                                 </div>
+                                {message.sources.length > 8 && (
+                                  <details className="qg-citations-extra">
+                                    <summary>Show {message.sources.length - 8} more referenced passages</summary>
+                                    <div className="qg-citation-list">
+                                      {message.sources.slice(8).map((source, index) => (
+                                        <a key={source.chunk_id} className="qg-citation" href={sourceLink(source)} target="_blank" rel="noopener noreferrer" title={source.snippet.slice(0, 400)}>
+                                          <span>{index + 9}</span> {source.filename}{source.page ? ` · ${sourceLocation(source)}` : ""}{source.section ? ` · ${source.section}` : ""}<ArrowUpRight size={13}/>
+                                        </a>
+                                      ))}
+                                    </div>
+                                  </details>
+                                )}
                               </div>
                             )}
                           </div>
                         )}
-                        {!busy && !startingExam && !editingMessageId && !message.id.startsWith("pending-") && (
+                        {(!!message.content.trim() || (!busy && !startingExam && !editingMessageId && !message.id.startsWith("pending-"))) && (
                           <div className={`qg-message-tools ${message.role === "user" ? "qg-message-tools--user" : ""}`}>
-                            {message.role === "user" ? (
+                            {!!message.content.trim() && (
+                              <button type="button" onClick={() => void copyChatMessage(message)}
+                                className={copyFeedback?.id === message.id ? `qg-message-copy--${copyFeedback.status}` : ""}
+                                title={copyFeedback?.id === message.id && copyFeedback.status === "error" ? "Unable to copy this message" : "Copy message text"}
+                                aria-label={copyFeedback?.id === message.id && copyFeedback.status === "copied" ? "Message copied" : `Copy ${message.role === "user" ? "message" : "QuestGen response"}`}>
+                                {copyFeedback?.id === message.id && copyFeedback.status === "copied" ? <Check size={14}/> : <Copy size={14}/>}
+                                <span>{copyFeedback?.id === message.id ? (copyFeedback.status === "copied" ? "Copied" : "Copy failed") : "Copy"}</span>
+                              </button>
+                            )}
+                            {!busy && !startingExam && !editingMessageId && !message.id.startsWith("pending-") && (message.role === "user" ? (
                               <button type="button" onClick={() => editChatMessage(message)} title="Edit this message" aria-label="Edit message">
                                 <Pencil size={14}/> <span>Edit</span>
                               </button>
@@ -924,7 +1023,7 @@ export default function ChatPage() {
                                 title="Regenerate this response" aria-label="Regenerate response">
                                 <RefreshCw size={14}/> <span>Regenerate</span>
                               </button>
-                            )}
+                            ))}
                           </div>
                         )}
                       </div>
@@ -987,10 +1086,19 @@ export default function ChatPage() {
                     <button type="button" onClick={cancelMessageEdit} disabled={busy} aria-label="Cancel message editing"><X size={14}/> Cancel</button>
                   </div>
                 )}
+                {!editingMessageId && <div className="qg-compose-scope" role="status">
+                  {attachedDocuments.length > 0
+                    ? `Using ${attachedDocuments.length} selected ${attachedDocuments.length === 1 ? "material" : "materials"} for this conversation`
+                    : libraryDocuments.some((doc) => doc.status === "ready")
+                      ? `Using all ${libraryDocuments.filter((doc) => doc.status === "ready").length} ready course materials by default`
+                      : libraryDocuments.some((doc) => doc.status !== "failed")
+                        ? "Course materials are still indexing; wait until they are ready"
+                        : "No indexed course materials yet; upload files to ground your questions"}
+                </div>}
                 {attachedDocuments.length > 0 && <div className="qg-attached-list" aria-label="Attached course materials">
                   {attachedDocuments.map((doc) => <span key={doc.id} className="qg-attached-chip"><Files size={13}/><span title={doc.filename}>{doc.filename}</span><button type="button" aria-label={`Remove ${doc.filename}`} onClick={() => setAttachedDocuments((old) => old.filter((item) => item.id !== doc.id))}><X size={13}/></button></span>)}
                 </div>}
-                <textarea ref={textRef} rows={2} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || !courseId || !settings.model} aria-label={editingMessageId ? "Edit message in composer" : "Message QuestGen"} placeholder={!settings.model ? "Choose a model in the top bar to begin…" : assessment?.status === "completed" ? "e.g. Make question 2 harder, or lock question 1…" : "Ask a question, refine an idea, or plan an assessment…"}/>
+                <textarea ref={textRef} rows={1} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || !courseId || !settings.model} aria-label={editingMessageId ? "Edit message in composer" : "Message QuestGen"} placeholder={!settings.model ? "Choose a model in the top bar to begin…" : assessment?.status === "completed" ? "e.g. Make question 2 harder, or lock question 1…" : "Ask a question, refine an idea, or plan an assessment…"}/>
                 <div className="qg-composer-actions">
                   {editingMessageId ? (
                     <span className="qg-edit-help">Enter to save · Shift+Enter for new line · Esc to cancel</span>
@@ -1024,6 +1132,41 @@ export default function ChatPage() {
           onClose={() => { setDocumentsOpen(false); void refreshLibrary(courseId).catch(() => {}); }}/>}
       </main>
 
+      {courseToDelete && (
+        <div className="qg-modal-backdrop" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !deletingCourse) { setCourseToDelete(null); setDeleteConfirmName(""); }
+        }}>
+          <div className="qg-dialog qg-delete-course-dialog" role="alertdialog" aria-modal="true"
+            aria-labelledby="qg-delete-course-title" aria-describedby="qg-delete-course-description">
+            <div className="qg-dialog-head">
+              <div><span className="qg-overline">PERMANENT DELETION</span><h2 id="qg-delete-course-title">Delete course?</h2></div>
+              <button type="button" className="qg-icon-button" aria-label="Close confirmation" disabled={deletingCourse}
+                onClick={() => { setCourseToDelete(null); setDeleteConfirmName(""); }}><X size={19}/></button>
+            </div>
+            <p id="qg-delete-course-description" className="qg-delete-course-warning">
+              Deleting <strong>{courseToDelete.name}</strong> permanently removes its uploaded files, indexed materials,
+              conversations, citations, generated assessments, and related records. Other courses are not affected.
+              This cannot be undone.
+            </p>
+            <label className="qg-delete-course-label" htmlFor="qg-delete-course-confirm">
+              Type <strong>{courseToDelete.name}</strong> to confirm
+            </label>
+            <input id="qg-delete-course-confirm" className="qg-delete-course-input" autoFocus autoComplete="off"
+              value={deleteConfirmName} onChange={(event) => setDeleteConfirmName(event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Escape" && !deletingCourse) { setCourseToDelete(null); setDeleteConfirmName(""); } }} />
+            {courseDeleteError && <p role="alert" className="qg-delete-course-error">{courseDeleteError}</p>}
+            <div className="qg-delete-course-actions">
+              <button type="button" className="qg-delete-cancel" disabled={deletingCourse}
+                onClick={() => { setCourseToDelete(null); setDeleteConfirmName(""); }}>Cancel</button>
+              <button type="button" className="qg-delete-confirm" disabled={busy || deletingCourse || deleteConfirmName !== courseToDelete.name}
+                onClick={() => void confirmDeleteCourse()}>
+                {deletingCourse ? <Loader2 size={16} className="qg-spin"/> : <Trash2 size={16}/>}
+                {deletingCourse ? "Deleting…" : "Delete course and data"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {(settingsOpen || courseOpen) && (
         <div className="qg-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) { setSettingsOpen(false); setCourseOpen(false); } }}>
           <div role="dialog" aria-modal="true" aria-label={settingsOpen ? "Model settings" : "New course"} className="qg-dialog">
