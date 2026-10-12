@@ -365,7 +365,7 @@ def export_assessment(conn: sqlite3.Connection, job_id: str, audience: Literal['
                 document.add_paragraph('Review: ' + q['review_status'])
                 for source in c.get('sources', []):
                     document.add_paragraph('Source: ' + str(source.get('filename','Course material')) +
-                        (f" · page {source['page']}" if source.get('page') is not None else ''))
+                        (f" · {'slide' if source.get('extension') == '.pptx' else 'page'} {source['page']}" if source.get('page') is not None else ''))
         output = io.BytesIO()
         document.save(output)
         body = output.getvalue()
@@ -399,7 +399,7 @@ def export_assessment(conn: sqlite3.Connection, job_id: str, audience: Literal['
                 for src in c.get('sources', []):
                     label = str(src.get('filename', 'Course material'))
                     if src.get('page') is not None:
-                        label += f" - page {src['page']}"
+                        label += f" - {'slide' if src.get('extension') == '.pptx' else 'page'} {src['page']}"
                     block.append(Paragraph('Source: ' + escape(label), styles['Normal']))
             story.append(KeepTogether(block))
         pdf = SimpleDocTemplate(output, pagesize=A4, rightMargin=48, leftMargin=48,

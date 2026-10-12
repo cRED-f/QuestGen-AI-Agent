@@ -107,6 +107,14 @@ def init_db() -> None:
         provider_config.ensure_tables(conn)
         documents.ensure_tables(conn)
         generation.ensure_tables(conn)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS message_documents (
+                message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (message_id, document_id)
+            );
+        """)
         customization.ensure_tables(conn)
         if not conn.execute("SELECT 1 FROM courses LIMIT 1").fetchone():
             conn.execute(
@@ -185,6 +193,7 @@ class MessageInput(BaseModel):
     content: str = Field(default="", max_length=12000)
     edit_message_id: str | None = Field(default=None, min_length=1, max_length=128)
     regenerate_message_id: str | None = Field(default=None, min_length=1, max_length=128)
+    document_ids: list[str] | None = Field(default=None, max_length=30)
 
     @field_validator("content")
     @classmethod
@@ -287,16 +296,28 @@ def delete_thread(thread_id: str):
 @app.get("/api/threads/{thread_id}/messages")
 def list_messages(thread_id: str):
     with database() as conn:
-        fetch_or_404(conn, "threads", thread_id)
+        thread = fetch_or_404(conn, "threads", thread_id)
         messages = [dict(r) for r in conn.execute(
             "SELECT * FROM messages WHERE thread_id=? ORDER BY created_at, rowid", (thread_id,)
         )]
         for message in messages:
+            message["documents"] = [dict(row) for row in conn.execute(
+                "SELECT d.id, d.filename, d.extension FROM message_documents a "
+                "JOIN documents d ON d.id=a.document_id WHERE a.message_id=? "
+                "AND d.course_id=? ORDER BY a.position",
+                (message["id"], thread["course_id"]),
+            )] if message["role"] == "user" else []
             message["sources"] = [src for row in conn.execute(
                 "SELECT chunk_id FROM message_sources WHERE message_id=? ORDER BY position",
                 (message["id"],)
             ) if (src := documents.source_for_chunk(conn, row["chunk_id"]))]
         return messages
+
+
+@app.get("/api/ocr/status")
+def get_ocr_status():
+    """Inspect the OCR executable from the same process that indexes documents."""
+    return {**documents.ocr_health(), "vision_configured": bool(os.getenv("QUESTGEN_VISION_MODEL", "").strip())}
 
 
 @app.get("/api/courses/{course_id}/documents")
@@ -370,6 +391,23 @@ def document_detail(course_id: str, document_id: str):
         return dict(row)
 
 
+@app.post("/api/courses/{course_id}/documents/{document_id}/reprocess", status_code=202)
+def reprocess_document(course_id: str, document_id: str):
+    """Explicitly retry extraction after OCR/vision configuration changes."""
+    with database() as conn:
+        row = conn.execute("SELECT * FROM documents WHERE id=? AND course_id=?", (document_id, course_id)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Document not found in course")
+        if row["status"] not in ("ready", "failed"):
+            raise HTTPException(status_code=409, detail="Document is already processing")
+        if not documents.document_path(document_id, row["extension"]).is_file():
+            raise HTTPException(status_code=404, detail="Stored document file is missing")
+        conn.execute("UPDATE documents SET status='queued', progress=10, error=NULL, "
+                     "warning=NULL, updated_at=? WHERE id=?", (now(), document_id))
+    app.state.document_queue.put_nowait(document_id)
+    return {"id": document_id, "status": "queued", "progress": 10}
+
+
 @app.get("/api/courses/{course_id}/documents/{document_id}/file")
 def open_document(course_id: str, document_id: str):
     with database() as conn:
@@ -380,9 +418,12 @@ def open_document(course_id: str, document_id: str):
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Stored file is missing")
     mime = {".pdf": "application/pdf", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ".txt": "text/plain", ".md": "text/plain"}[row["extension"]]
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".txt": "text/plain", ".md": "text/plain",
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".webp": "image/webp", ".bmp": "image/bmp", ".tif": "image/tiff", ".tiff": "image/tiff"}[row["extension"]]
     return FileResponse(path, filename=row["filename"], media_type=mime,
-                        content_disposition_type="inline" if row["extension"] == ".pdf" else "attachment",
+                        content_disposition_type="inline" if row["extension"] == ".pdf" or row["extension"] in documents.IMAGE_FORMATS else "attachment",
                         headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
 
 
@@ -558,6 +599,11 @@ async def stream_message(thread_id: str, data: MessageInput):
         # Message actions are applied atomically before streaming. A past edit or
         # regeneration replaces that turn's subsequent chat history, not the exam
         # drafts saved in separate assessment tables.
+        if data.document_ids is not None:
+            try:
+                documents.verify_course_documents(conn, thread["course_id"], data.document_ids)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         rows = [dict(row) for row in conn.execute(
             "SELECT rowid AS seq, id, role, content FROM messages "
             "WHERE thread_id=? ORDER BY rowid", (thread_id,)
@@ -604,9 +650,27 @@ async def stream_message(thread_id: str, data: MessageInput):
                     "UPDATE threads SET title=? WHERE id=?",
                     (content[:60], thread_id),
                 )
+        # An explicit selection restricts retrieval. No selection keeps legacy
+        # course-wide search, while a reply regeneration reuses the original files.
+        if data.regenerate_message_id:
+            selected_ids = [r["document_id"] for r in conn.execute(
+                "SELECT document_id FROM message_documents WHERE message_id=? ORDER BY position", (user_id,)
+            )]
+        elif data.document_ids is not None:
+            selected_ids = data.document_ids
+            conn.execute("DELETE FROM message_documents WHERE message_id=?", (user_id,))
+            conn.executemany(
+                "INSERT INTO message_documents(message_id,document_id,position) VALUES (?,?,?)",
+                [(user_id, doc_id, i) for i, doc_id in enumerate(selected_ids)],
+            )
+        else:
+            selected_ids = [r["document_id"] for r in conn.execute(
+                "SELECT document_id FROM message_documents WHERE message_id=? ORDER BY position", (user_id,)
+            )]
         prior = [{"role": item["role"], "content": item["content"]}
                  for item in prior_rows[-30:]]
-        sources = await asyncio.to_thread(documents.retrieve, thread["course_id"], content, 5)
+        sources = await asyncio.to_thread(documents.retrieve, thread["course_id"], content, 5,
+                                           selected_ids or None)
         conn.execute("UPDATE threads SET updated_at=? WHERE id=?", (now(), thread_id))
 
     async def events() -> AsyncIterator[str]:
@@ -618,7 +682,7 @@ async def stream_message(thread_id: str, data: MessageInput):
             if sources:
                 context = "\n\n".join(
                     f"[{i}] {src['filename']}"
-                    + (f" (page {src['page']})" if src['page'] else "")
+                    + (f" ({'slide' if src['extension'] == '.pptx' else 'page'} {src['page']})" if src['page'] else "")
                     + (f" ({src['section']})" if src['section'] else "")
                     + f"\n{src['snippet']}"
                     for i, src in enumerate(sources, 1)
@@ -665,6 +729,7 @@ async def stream_message(thread_id: str, data: MessageInput):
 
 class AssessmentInput(BaseModel):
     prompt: str = Field(min_length=5, max_length=12000)
+    document_ids: list[str] = Field(default_factory=list, max_length=30)
 
     @field_validator("prompt")
     @classmethod
@@ -697,12 +762,16 @@ async def start_assessment(thread_id: str, data: AssessmentInput):
         ).fetchone()
         if active:
             raise HTTPException(status_code=409, detail="An assessment is already generating in this conversation")
+        try:
+            documents.verify_course_documents(conn, thread["course_id"], data.document_ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         job_id = identifier()
         timestamp = now()
-        conn.execute("INSERT INTO assessment_jobs(id,thread_id,course_id,prompt,provider,model,status,stage,created_at,updated_at) "
-                     "VALUES (?,?,?,?,?,?,'queued','queued',?,?)",
+        conn.execute("INSERT INTO assessment_jobs(id,thread_id,course_id,prompt,provider,model,status,stage,document_ids,created_at,updated_at) "
+                     "VALUES (?,?,?,?,?,?,'queued','queued',?,?,?)",
                      (job_id, thread_id, thread["course_id"], data.prompt,
-                      settings["provider"], settings["model"], timestamp, timestamp))
+                      settings["provider"], settings["model"], json.dumps(data.document_ids), timestamp, timestamp))
         generation.emit(conn, job_id, "queued", "Assessment queued", 0)
         if thread["title"] == "New conversation":
             conn.execute("UPDATE threads SET title=?,updated_at=? WHERE id=?",

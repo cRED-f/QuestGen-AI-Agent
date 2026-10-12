@@ -5,6 +5,12 @@ import { useEffect, useRef, useState } from "react";
 
 export type PickerOption = { value: string; label: string; detail?: string };
 
+// Some providers return the model ID as its display name. Show it once.
+function distinctDetail(option: PickerOption): string {
+  const detail = option.detail?.trim() || "";
+  return detail && detail.toLocaleLowerCase() !== option.label.trim().toLocaleLowerCase() ? detail : "";
+}
+
 type Props = {
   ariaLabel: string;
   value: string;
@@ -43,13 +49,15 @@ export default function PencilSelect({ ariaLabel, value, options, onChange,
   }, [open]);
   useEffect(() => { if (open && searchable) searchRef.current?.focus(); }, [open, searchable]);
   const selected = options.find((item) => item.value === value);
+  const selectedDetail = selected ? distinctDetail(selected) : "";
   const shown = options.filter((item) => `${item.label} ${item.value}`.toLowerCase().includes(query.toLowerCase()));
   return <div className={`qg-pencil-picker qg-pencil-picker--${placement}`} ref={root}>
     <button type="button" className={`qg-pencil-trigger ${open ? "qg-pencil-trigger--open" : ""}`} aria-label={ariaLabel}
       aria-haspopup="listbox" aria-expanded={open} disabled={disabled}
       onClick={() => { setOpen((previous) => !previous); setQuery(""); }}>
       <span className="qg-pencil-trigger-copy"><span className="qg-pencil-trigger-main">{selected?.label || value || placeholder}</span>
-      {placement === "topbar" && <span className="qg-pencil-trigger-sub">{selected?.detail || "Click to choose a model"}</span>}</span>
+      {placement === "topbar" && (selectedDetail || (!value ? "Click to choose a model" : "")) &&
+        <span className="qg-pencil-trigger-sub">{selectedDetail || "Click to choose a model"}</span>}</span>
       <ChevronDown size={15} aria-hidden="true"/>
     </button>
     {open && <div className="qg-pencil-menu" role="group" aria-label={ariaLabel}>
@@ -65,7 +73,7 @@ export default function PencilSelect({ ariaLabel, value, options, onChange,
             <div className="qg-pencil-empty">{options.length ? "No matching models." : "No models available. Check the provider connection."}</div> :
           shown.map((item) => <button key={item.value} role="option" aria-selected={value === item.value} type="button" className="qg-pencil-option"
             onClick={() => { onChange(item.value); setOpen(false); setQuery(""); }}>
-            <span className="qg-pencil-option-content"><strong>{item.label}</strong>{item.detail && <small>{item.detail}</small>}</span>
+            <span className="qg-pencil-option-content"><strong>{item.label}</strong>{distinctDetail(item) && <small>{distinctDetail(item)}</small>}</span>
             {value === item.value && <Check size={16} aria-hidden="true"/>}
           </button>)}
       </div>

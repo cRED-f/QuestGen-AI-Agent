@@ -92,6 +92,8 @@ def ensure_tables(conn: sqlite3.Connection):
         );
         CREATE INDEX IF NOT EXISTS assessment_events_job ON assessment_events(job_id,id);
     """)
+    if "document_ids" not in {r["name"] for r in conn.execute("PRAGMA table_info(assessment_jobs)")}:
+        conn.execute("ALTER TABLE assessment_jobs ADD COLUMN document_ids TEXT NOT NULL DEFAULT '[]'")
 
 
 def emit(conn, job_id: str, stage: str, message: str, progress: int):
@@ -107,6 +109,7 @@ def get_job(conn, job_id: str) -> dict:
         raise LookupError("Assessment not found")
     job = dict(row)
     job["blueprint"] = json.loads(job["blueprint"]) if job["blueprint"] else None
+    job["document_ids"] = json.loads(job["document_ids"] or "[]")
     job["questions"] = [dict(item) for item in conn.execute(
         "SELECT id,ordinal,content,created_at,version,locked,review_status,review_note,reviewed_at FROM assessment_questions WHERE job_id=? ORDER BY ordinal", (job_id,)
     )]
@@ -174,12 +177,14 @@ async def create_blueprint(job: dict, settings: dict) -> AssessmentBlueprint:
         raise RuntimeError("Deep Agents dependencies are missing. Install backend/requirements.txt") from exc
     from backend.app import ROOT
 
+    selected = json.loads(job.get("document_ids") or "[]")
+
     @tool
     def search_course_materials(query: str) -> str:
         """Search the selected professor's course material for grounded academic excerpts."""
-        found = documents.retrieve(job["course_id"], query[:500], 6)
+        found = documents.retrieve(job["course_id"], query[:500], 6, selected or None)
         return json.dumps([{
-            "filename": src["filename"], "page": src["page"],
+            "filename": src["filename"], "extension": src["extension"], "page": src["page"],
             "section": src["section"], "snippet": src["snippet"][:850]
         } for src in found], ensure_ascii=False)
 
@@ -292,7 +297,8 @@ async def run_generation(job_id: str):
                     continue
                 emit(conn, job_id, "retrieval", f"Finding sources for question {i + 1}",
                      15 + int(75 * i / len(blueprint.questions)))
-            sources = await asyncio.to_thread(documents.retrieve, job["course_id"], plan.topic, 5)
+            sources = await asyncio.to_thread(documents.retrieve, job["course_id"], plan.topic, 5,
+                                              json.loads(job.get("document_ids") or "[]") or None)
             feedback = ""
             for attempt in range(1, MAX_ATTEMPTS + 1):
                 with database() as conn:

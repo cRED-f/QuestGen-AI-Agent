@@ -31,7 +31,7 @@ import {
 } from "lucide-react";
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import { DocumentPanel, Source, sourceLink } from "@/components/workspace/DocumentPanel";
+import { DocumentPanel, type CourseMaterial, Source, sourceLink, sourceLocation } from "@/components/workspace/DocumentPanel";
 import QuestionEditor, { type AssessmentQuestion } from "@/components/workspace/QuestionEditor";
 import PencilSelect from "@/components/workspace/PencilSelect";
 
@@ -43,6 +43,7 @@ type ChatMessage = {
   content: string;
   created_at: number;
   sources?: Source[];
+  documents?: CourseMaterial[];
 };
 type AssessmentActivity = { id: number; stage: string; message: string; progress: number };
 type AssessmentJob = {
@@ -52,6 +53,7 @@ type AssessmentJob = {
   prompt: string;
   blueprint: null | { title: string; instructions: string; total_marks: number; questions: unknown[] };
   questions: AssessmentQuestion[];
+  document_ids?: string[];
   events: AssessmentActivity[];
   error: string | null;
 };
@@ -180,6 +182,9 @@ export default function ChatPage() {
   const [connectionProblem, setConnectionProblem] = useState("");
   const [testingConnection, setTestingConnection] = useState(false);
   const [documentsOpen, setDocumentsOpen] = useState(false);
+  const [documentMode, setDocumentMode] = useState<"library" | "picker">("library");
+  const [libraryDocuments, setLibraryDocuments] = useState<CourseMaterial[]>([]);
+  const [attachedDocuments, setAttachedDocuments] = useState<CourseMaterial[]>([]);
   const [courseOpen, setCourseOpen] = useState(false);
   const [courseName, setCourseName] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -194,8 +199,25 @@ export default function ChatPage() {
   const scrollRef = useRef<HTMLElement | null>(null);
   const textRef = useRef<HTMLTextAreaElement | null>(null);
   const savedComposerDraftRef = useRef("");
+  const savedAttachmentsRef = useRef<CourseMaterial[]>([]);
+  const activeCourseRef = useRef("");
   const currentCourse = courses.find((course) => course.id === courseId);
   const currentThread = threads.find((thread) => thread.id === threadId);
+
+  const refreshLibrary = useCallback(async (id: string) => {
+    const data = await requestJson<CourseMaterial[]>(`/courses/${encodeURIComponent(id)}/documents`);
+    if (activeCourseRef.current !== id) return;
+    setLibraryDocuments(data);
+    // Deleted or no-longer-ready documents cannot be included in new requests.
+    setAttachedDocuments((old) => old.filter((item) => data.some((doc) => doc.id === item.id && doc.status === "ready")));
+  }, []);
+
+  const openLibrary = (mode: "library" | "picker") => {
+    setDocumentMode(mode);
+    setDocumentsOpen(true);
+    setSidebarOpen(false);
+    if (courseId) void refreshLibrary(courseId).catch(() => {});
+  };
 
   const refreshThreads = useCallback(async (id: string) => {
     const data = await requestJson<Thread[]>(`/threads?course_id=${encodeURIComponent(id)}`);
@@ -250,9 +272,13 @@ export default function ChatPage() {
   useEffect(() => {
     if (!courseId) return;
     let active = true;
+    activeCourseRef.current = courseId;
     window.localStorage.setItem("questgen:course", courseId);
     setThreads([]);
     setDocumentsOpen(false);
+    setLibraryDocuments([]);
+    setAttachedDocuments([]);
+    savedAttachmentsRef.current = [];
     setThreadId(null);
     setMessages([]);
     setEditingMessageId(null);
@@ -260,6 +286,8 @@ export default function ChatPage() {
     savedComposerDraftRef.current = "";
     setAssessment(null);
     setActivities([]);
+    void refreshLibrary(courseId).catch((cause: Error) => active && setError(cause.message));
+    const libraryPoll = window.setInterval(() => void refreshLibrary(courseId).catch(() => {}), 4500);
     refreshThreads(courseId).then((available) => {
       if (!active) return;
       const last = window.localStorage.getItem(`questgen:thread:${courseId}`);
@@ -270,8 +298,8 @@ export default function ChatPage() {
           .catch((cause: Error) => active && setError(cause.message));
       }
     }).catch((cause: Error) => active && setError(cause.message));
-    return () => { active = false; };
-  }, [courseId, refreshThreads]);
+    return () => { active = false; window.clearInterval(libraryPoll); };
+  }, [courseId, refreshThreads, refreshLibrary]);
 
   const refreshAssessment = useCallback(async (id: string) => {
     const jobs = await requestJson<AssessmentJob[]>(`/threads/${id}/generations`);
@@ -342,6 +370,8 @@ export default function ChatPage() {
     savedComposerDraftRef.current = "";
     setAssessment(null);
     setActivities([]);
+    setAttachedDocuments([]);
+    savedAttachmentsRef.current = [];
     setError("");
     setSidebarOpen(false);
     if (courseId) window.localStorage.removeItem(`questgen:thread:${courseId}`);
@@ -357,6 +387,8 @@ export default function ChatPage() {
     savedComposerDraftRef.current = "";
     setAssessment(null);
     setActivities([]);
+    setAttachedDocuments([]);
+    savedAttachmentsRef.current = [];
     setSidebarOpen(false);
     window.localStorage.setItem(`questgen:thread:${courseId}`, id);
     try {
@@ -497,6 +529,7 @@ export default function ChatPage() {
     setBusy(true);
     setError("");
     if (!action) setInput("");
+    const chosenDocuments = action?.regenerate_message_id ? [] : attachedDocuments;
     let editWasAccepted = false;
     const controller = new AbortController();
     abortRef.current = controller;
@@ -504,6 +537,7 @@ export default function ChatPage() {
     const timestamp = Date.now();
     const user: ChatMessage = {
       id: `pending-user-${timestamp}`, role: "user", content, created_at: timestamp / 1000,
+      documents: chosenDocuments,
     };
     const answer: ChatMessage = {
       id: `pending-answer-${timestamp}`, role: "assistant", content: "", created_at: timestamp / 1000,
@@ -512,7 +546,7 @@ export default function ChatPage() {
       if (action?.edit_message_id) {
         const index = previous.findIndex((item) => item.id === action.edit_message_id);
         if (index < 0) return previous;
-        return [...previous.slice(0, index), { ...previous[index], content }, answer];
+        return [...previous.slice(0, index), { ...previous[index], content, documents: chosenDocuments }, answer];
       }
       if (action?.regenerate_message_id) {
         const index = previous.findIndex((item) => item.id === action.regenerate_message_id);
@@ -538,6 +572,7 @@ export default function ChatPage() {
         body: JSON.stringify({
           ...(action?.regenerate_message_id ? {} : { content }),
           ...action,
+          ...(!action?.regenerate_message_id ? { document_ids: chosenDocuments.map((doc) => doc.id) } : {}),
         }),
         signal: controller.signal,
       });
@@ -570,10 +605,13 @@ export default function ChatPage() {
     } finally {
       abortRef.current = null;
       setBusy(false);
+      if (!action && !controller.signal.aborted) setAttachedDocuments([]);
       if (editWasAccepted) {
         setEditingMessageId(null);
         setInput(savedComposerDraftRef.current);
         savedComposerDraftRef.current = "";
+        setAttachedDocuments(savedAttachmentsRef.current);
+        savedAttachmentsRef.current = [];
       }
       if (activeId) {
         try {
@@ -593,7 +631,11 @@ export default function ChatPage() {
   const editChatMessage = (message: ChatMessage) => {
     if (busy || startingExam || message.id.startsWith("pending-")) return;
     // Keep the unsent draft so Cancel (or a completed edit) can restore it.
-    if (!editingMessageId) savedComposerDraftRef.current = input;
+    if (!editingMessageId) {
+      savedComposerDraftRef.current = input;
+      savedAttachmentsRef.current = attachedDocuments;
+    }
+    setAttachedDocuments(message.documents || []);
     setEditingMessageId(message.id);
     setInput(message.content);
     setError("");
@@ -604,6 +646,8 @@ export default function ChatPage() {
     setEditingMessageId(null);
     setInput(savedComposerDraftRef.current);
     savedComposerDraftRef.current = "";
+    setAttachedDocuments(savedAttachmentsRef.current);
+    savedAttachmentsRef.current = [];
     setError("");
     textRef.current?.focus();
   };
@@ -625,11 +669,12 @@ export default function ChatPage() {
         window.localStorage.setItem(`questgen:thread:${courseId}`, target);
       }
       const job = await requestJson<AssessmentJob>(`/threads/${target}/generations`, {
-        method: "POST", body: JSON.stringify({ prompt }),
+        method: "POST", body: JSON.stringify({ prompt, document_ids: attachedDocuments.map((doc) => doc.id) }),
       });
       setAssessment(job);
       setActivities(job.events || []);
       setInput("");
+      setAttachedDocuments([]);
       setShowAnswers(false);
       await refreshThreads(courseId);
     } catch (cause) {
@@ -752,11 +797,20 @@ export default function ChatPage() {
           </div>
 
           <div className="qg-side-section qg-library-section">
-            <div className="qg-section-header"><span className="qg-overline">02 / LIBRARY</span></div>
-            <button type="button" className="qg-library-link" onClick={() => { setDocumentsOpen(true); setSidebarOpen(false); }} disabled={!courseId}>
-              <Files size={18} strokeWidth={1.8}/><span>Course materials</span><ArrowUpRight size={15} className="qg-link-tail"/>
+            <div className="qg-section-header"><span className="qg-overline">02 / LIBRARY</span><span className="qg-count">{libraryDocuments.length}</span></div>
+            <button type="button" className="qg-library-link" onClick={() => openLibrary("library")} disabled={!courseId}>
+              <Files size={18} strokeWidth={1.8}/><span>Manage {currentCourse?.name || "course"} library</span><ArrowUpRight size={15} className="qg-link-tail"/>
             </button>
-            <div className="qg-library-note">Upload lectures, find passages, and cite your sources.</div>
+            <div className="qg-library-note">Files remain in their own course space.</div>
+            <div className="qg-library-files" aria-label="Files in selected course">
+              {libraryDocuments.length === 0 && <span className="qg-library-empty">No materials yet</span>}
+              {libraryDocuments.map((doc) => (
+                <button type="button" className="qg-library-file" key={doc.id} title={doc.filename} onClick={() => openLibrary("library")}>
+                  <Files size={14} aria-hidden="true"/><span>{doc.filename}</span>
+                  {doc.status !== "ready" && <span className="qg-library-status" title={doc.status}>·</span>}
+                </button>
+              ))}
+            </div>
           </div>
 
           <div className="qg-side-section qg-history-section">
@@ -794,10 +848,10 @@ export default function ChatPage() {
           </div>
           <div className="qg-topbar-right">
             <span className="qg-current-label" title={currentThread?.title || "New conversation"}>{currentThread?.title || "Untitled conversation"}</span>
-            <button type="button" className="qg-topbar-button" onClick={() => setDocumentsOpen(true)} disabled={!courseId}><Files size={17}/><span>Materials</span></button>
+            <button type="button" className="qg-topbar-button" onClick={() => openLibrary("picker")} disabled={!courseId}><Files size={17}/><span>Materials</span></button>
             <PencilSelect ariaLabel={`${PROVIDERS.find((item) => item.value === settings.provider)?.label || "Provider"} models`} placement="topbar" value={settings.model}
               placeholder="Choose a model" disabled={busy || startingExam}
-              options={availableModels.map((item) => ({ value: item.id, label: item.name, detail: item.id }))}
+              options={availableModels.map((item) => ({ value: item.id, label: item.name, detail: item.name === item.id ? undefined : item.id }))}
               searchable loading={modelsLoading} error={modelsError}
               onRefresh={() => setModelRefresh((previous) => previous + 1)} onChange={(id) => void selectModel(id)}/>
           </div>
@@ -822,7 +876,7 @@ export default function ChatPage() {
                       </button>
                     ))}
                   </div>
-                  <button type="button" onClick={() => setDocumentsOpen(true)} className="qg-source-hint" disabled={!courseId}>
+                  <button type="button" onClick={() => openLibrary("picker")} className="qg-source-hint" disabled={!courseId}>
                     <span className="qg-source-hint-icon"><Paperclip size={17}/></span>
                     <span><strong>Working from your own lectures?</strong> Add course materials for grounded answers.</span>
                     <ArrowRight size={16}/>
@@ -839,6 +893,7 @@ export default function ChatPage() {
                         {message.role === "user" ? (
                           <>
                             <div className={`qg-user-note ${editingMessageId === message.id ? "qg-user-note--editing" : ""}`}>{message.content}</div>
+                            {!!message.documents?.length && <div className="qg-message-files">{message.documents.map((doc) => <span key={doc.id}><Paperclip size={12}/>{doc.filename}</span>)}</div>}
                             {editingMessageId === message.id && <div className="qg-message-editing-indicator"><Pencil size={12}/> Editing in the message box below</div>}
                           </>
                         ) : (
@@ -850,7 +905,7 @@ export default function ChatPage() {
                                 <div className="qg-citation-list">
                                   {message.sources.map((source, index) => (
                                     <a key={source.chunk_id} className="qg-citation" href={sourceLink(source)} target="_blank" rel="noopener noreferrer" title={source.snippet.slice(0, 400)}>
-                                      <span>{index + 1}</span> {source.filename}{source.page ? ` · p. ${source.page}` : ""}{source.section ? ` · ${source.section}` : ""}<ArrowUpRight size={13}/>
+                                      <span>{index + 1}</span> {source.filename}{source.page ? ` · ${sourceLocation(source)}` : ""}{source.section ? ` · ${source.section}` : ""}<ArrowUpRight size={13}/>
                                     </a>
                                   ))}
                                 </div>
@@ -932,13 +987,16 @@ export default function ChatPage() {
                     <button type="button" onClick={cancelMessageEdit} disabled={busy} aria-label="Cancel message editing"><X size={14}/> Cancel</button>
                   </div>
                 )}
+                {attachedDocuments.length > 0 && <div className="qg-attached-list" aria-label="Attached course materials">
+                  {attachedDocuments.map((doc) => <span key={doc.id} className="qg-attached-chip"><Files size={13}/><span title={doc.filename}>{doc.filename}</span><button type="button" aria-label={`Remove ${doc.filename}`} onClick={() => setAttachedDocuments((old) => old.filter((item) => item.id !== doc.id))}><X size={13}/></button></span>)}
+                </div>}
                 <textarea ref={textRef} rows={2} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || !courseId || !settings.model} aria-label={editingMessageId ? "Edit message in composer" : "Message QuestGen"} placeholder={!settings.model ? "Choose a model in the top bar to begin…" : assessment?.status === "completed" ? "e.g. Make question 2 harder, or lock question 1…" : "Ask a question, refine an idea, or plan an assessment…"}/>
                 <div className="qg-composer-actions">
                   {editingMessageId ? (
                     <span className="qg-edit-help">Enter to save · Shift+Enter for new line · Esc to cancel</span>
                   ) : (
                     <>
-                      <button type="button" onClick={() => setDocumentsOpen(true)} disabled={!courseId} className="qg-attach"><Paperclip size={17}/><span>Attach course material</span></button>
+                      <button type="button" onClick={() => openLibrary("picker")} disabled={!courseId} className="qg-attach"><Paperclip size={17}/><span>Attach course material</span></button>
                       <span className="qg-keyboard-tip">↵ to send · shift ↵ for new line</span>
                       {assessment?.status === "completed" && <button type="button" className="qg-assessment-action" onClick={() => void customizeAssessment()}
                         disabled={!input.trim() || busy || startingExam || editingQuestionId !== null} title="Apply conversational edits to question(s) in this assessment">
@@ -960,7 +1018,10 @@ export default function ChatPage() {
             </div>
           </div>
         </div>
-        {documentsOpen && courseId && <DocumentPanel courseId={courseId} onClose={() => setDocumentsOpen(false)}/>}
+        {documentsOpen && courseId && <DocumentPanel key={`${courseId}:${documentMode}`} courseId={courseId} courseName={currentCourse?.name || "Course"}
+          mode={documentMode} selectedIds={attachedDocuments.map((doc) => doc.id)}
+          onSelect={setAttachedDocuments} onChanged={() => void refreshLibrary(courseId).catch(() => {})}
+          onClose={() => { setDocumentsOpen(false); void refreshLibrary(courseId).catch(() => {}); }}/>}
       </main>
 
       {(settingsOpen || courseOpen) && (

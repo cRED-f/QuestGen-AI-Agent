@@ -452,3 +452,40 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .qg-connection-actions .qg-primary-submit { font-size: 12px; }
 .qg-test-provider:disabled, .qg-primary-submit:disabled { opacity: .55; cursor: wait; }
 @media (max-width: 450px) { .qg-connection-actions { grid-template-columns: 1fr; } .qg-dialog:has(.qg-connection-form) { max-height: 91dvh; } }
+
+.qg-ocr-status { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 8px; font-size: 11px; color: var(--qg-muted); }
+.qg-ocr-check { background: transparent; border: 1px solid var(--qg-border); border-radius: 7px; padding: 5px 9px; color: var(--qg-sage); font-size: 11px; }
+.qg-ocr-check:hover { background: var(--qg-sidebar); }
+.qg-ocr-ok { color: var(--qg-sage); }
+
+/* Course-specific Library and attach-existing-material picker */
+.qg-library-files { display: flex; flex-direction: column; gap: 3px; max-height: 185px; overflow-y: auto; margin-top: 10px; padding: 2px 3px 3px; }
+.qg-library-file { display: flex; align-items: center; width: 100%; min-width: 0; gap: 8px; border: none; border-radius: 7px; padding: 7px 8px; background: transparent; text-align: left; color: #64715f; font-size: 11px; }
+.qg-library-file:hover, .qg-library-file:focus-visible { background: #e6e9dd; color: #364a35; }
+.qg-library-file svg { flex-shrink: 0; }
+.qg-library-file > span:not(.qg-library-status) { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.qg-library-status { margin-left: auto; color: #c08363; font-weight: 700; }
+.qg-library-empty { padding: 7px 8px; color: #9ba092; font-size: 11px; }
+.qg-library-filter { display: flex; align-items: center; gap: 9px; padding: 10px 12px; border: 1px solid #dcded3; border-radius: 8px; background: #fffefa; color: #879780; margin-bottom: 14px; }
+.qg-library-filter:focus-within { border-color: #9cac92; }
+.qg-library-filter input { min-width: 0; flex: 1; border: 0; outline: none; background: transparent; font-size: 12px; color: #384539; }
+.qg-picker-intro { margin-bottom: 14px; border-left: 2px solid #9aa88c; padding: 4px 10px; font-size: 11px; color: #777f72; line-height: 1.55; }
+.qg-picker-check { display: flex; align-self: start; align-items: center; justify-content: center; flex: 0 0 22px; min-height: 38px; cursor: pointer; }
+.qg-picker-check input { accent-color: #687d63; width: 16px; height: 16px; cursor: pointer; }
+.qg-picker-check input:disabled { cursor: not-allowed; }
+.qg-file-item--selected { border-color: #9fae96; background: #f2f6ee; }
+.qg-picker-footer { display: flex; align-items: center; justify-content: space-between; gap: 9px; border-top: 1px solid #e2e2d5; padding: 13px 20px; background: #f8f8f1; color: #808776; font-size: 11px; }
+.qg-picker-apply { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 11px 13px; border: 1px solid #485849; background: #485849; border-radius: 8px; color: #fffefa; font-size: 11px; font-weight: 700; }
+.qg-picker-apply:hover:not(:disabled) { background: #607361; }
+.qg-attached-list { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 12px 0 2px; }
+.qg-attached-chip { display: inline-flex; align-items: center; gap: 6px; max-width: min(100%, 250px); padding: 6px 6px 6px 9px; border: 1px solid #cfdac8; background: #f0f5ec; border-radius: 7px; color: #5b7358; font-size: 11px; }
+.qg-attached-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qg-attached-chip button { display: inline-flex; align-items: center; justify-content: center; width: 19px; height: 19px; flex-shrink: 0; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #748a6e; }
+.qg-attached-chip button:hover { background: #d9e7d0; }
+.qg-message-files { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.qg-message-files span { display: inline-flex; gap: 5px; align-items: center; max-width: 230px; padding: 5px 8px; border: 1px solid #d9dfd1; border-radius: 6px; font-size: 10px; color: #73846b; background: #f8faf3; overflow-wrap: anywhere; }
+@media (max-width: 560px) {
+  .qg-picker-footer { flex-wrap: wrap; padding: 11px 15px; }
+  .qg-picker-apply { width: 100%; }
+  .qg-library-files { max-height: 140px; }
+}

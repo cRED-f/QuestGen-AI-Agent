@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { Check, ClipboardCheck, History, LockKeyhole, LockKeyholeOpen, PencilLine, RefreshCw, X } from "lucide-react";
-import { type Source, sourceLink } from "@/components/workspace/DocumentPanel";
+import { type Source, sourceLink, sourceLocation } from "@/components/workspace/DocumentPanel";
 
 export type AssessmentQuestion = {
   id: string;
@@ -71,7 +71,7 @@ export default function QuestionEditor({ question: q, showAnswers, disabled, onC
     {!!q.content.options.length && <ol type="A">{q.content.options.map((option, i) => <li key={i}>{option}</li>)}</ol>}
     {showAnswers && <div className="qg-assessment-answer"><strong>Answer:</strong> {q.content.correct_answer}<p>{q.content.explanation}</p></div>}
     <div className="qg-assessment-citations">
-      {q.content.sources?.length ? q.content.sources.map((source) => <a key={source.chunk_id} href={sourceLink(source)} target="_blank" rel="noopener noreferrer">{source.filename}{source.page ? ` · p. ${source.page}` : ""} ↗</a>) : <span>Not grounded in uploaded material</span>}
+      {q.content.sources?.length ? q.content.sources.map((source) => <a key={source.chunk_id} href={sourceLink(source)} target="_blank" rel="noopener noreferrer">{source.filename}{source.page ? ` · ${sourceLocation(source)}` : ""} ↗</a>) : <span>Not grounded in uploaded material</span>}
     </div>
     <div className="qg-question-actions">
       <button type="button" disabled={busy || q.locked} onClick={openEditor}><PencilLine size={14}/> Edit</button>
