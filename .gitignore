@@ -39,3 +39,12 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# QuestGen local backend state
+/backend/data/
+/backend/__pycache__/
+/backend/tests/__pycache__/
+.pytest_cache/
+
+# Allow checked-in examples without including actual secrets
+!backend/.env.example
