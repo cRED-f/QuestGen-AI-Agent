@@ -44,12 +44,13 @@ def invoke(provider="ollama", max_tokens=4096):
         max_tokens=max_tokens))
 
 
-def test_ollama_uses_json_mode_and_disables_thinking(monkeypatch):
+def test_ollama_uses_json_mode_but_keeps_thinking(monkeypatch):
     requests = stub_provider(monkeypatch, [(200, choice('{"stem":"What is a graph?"}'))])
     assert invoke() == {"stem": "What is a graph?"}
     assert requests[0]["max_tokens"] == 4096
     assert requests[0]["response_format"] == {"type": "json_object"}
-    assert requests[0]["reasoning_effort"] == "none"
+    # Thinking stays enabled; its reasoning is streamed live instead of disabled.
+    assert "reasoning_effort" not in requests[0]
     assert requests[0]["stream"] is False
 
 
@@ -109,7 +110,7 @@ def test_partial_json_never_fabricated(monkeypatch):
 def test_retry_increases_budget_after_truncation(monkeypatch):
     budgets = []
 
-    async def fake_json(settings, system, request, *, max_tokens=4096):
+    async def fake_json(settings, system, request, *, max_tokens=4096, on_reasoning=None):
         budgets.append(max_tokens)
         if len(budgets) == 1:
             raise ValueError("Model exhausted its output token limit before returning JSON")
@@ -126,4 +127,64 @@ def test_retry_increases_budget_after_truncation(monkeypatch):
     candidate = asyncio.run(generation.generate_question(
         {"provider": "ollama"}, plan, [], str(err.value)))
     assert candidate.correct_answer == "BFS"
-    assert budgets == [4096, 8192]
+    assert budgets == [8192, 16384]
+
+
+def _stream_response(*lines):
+    """An SSE body shaped like an OpenAI-compatible streaming completion."""
+    body = "\n\n".join(f"data: {json.dumps(line)}" for line in lines)
+    return httpx.Response(200, content=body + "\n\ndata: [DONE]\n\n")
+
+
+def _stub_stream(monkeypatch, lines):
+    requests = []
+    transport = httpx.MockTransport(lambda request: (
+        requests.append(json.loads(request.content)) or _stream_response(*lines)))
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(generation, "provider_details",
+                        lambda settings: ("http://local-model/v1/chat/completions", {}))
+    monkeypatch.setattr(generation.httpx, "AsyncClient",
+                        lambda *args, **kwargs: original_client(*args, transport=transport, **kwargs))
+    return requests
+
+
+def _delta(delta, finish=None):
+    return {"choices": [{"delta": delta, "finish_reason": finish}]}
+
+
+def test_streaming_forwards_reasoning_but_returns_only_json(monkeypatch):
+    _stub_stream(monkeypatch, [
+        _delta({"reasoning_content": "Let me think about "}),
+        _delta({"reasoning_content": "graphs first."}),
+        _delta({"content": '{"stem": "Which graph search uses a FIFO queue?"'}),
+        _delta({"content": "}"}, "stop"),
+    ])
+    seen = []
+    result = asyncio.run(generation.model_json(
+        {"provider": "ollama", "model": "test-model"}, "Output a question", {"topic": "graphs"},
+        max_tokens=4096, on_reasoning=seen.append))
+    assert result["stem"].startswith("Which graph search")
+    assert "".join(seen) == "Let me think about graphs first."
+
+
+def test_streaming_reasoning_only_is_never_returned_as_answer(monkeypatch):
+    _stub_stream(monkeypatch, [
+        _delta({"reasoning_content": '{"stem": "private thoughts"}'}),
+        _delta({}, "stop"),
+    ])
+    seen = []
+    with pytest.raises(ValueError, match="reasoning but no final JSON") as err:
+        asyncio.run(generation.model_json(
+            {"provider": "ollama", "model": "test-model"}, "Output a question", {},
+            on_reasoning=seen.append))
+    assert "private thoughts" not in str(err.value)
+
+
+def test_streaming_keeps_ollama_json_mode_and_stream_flag(monkeypatch):
+    requests = _stub_stream(monkeypatch, [
+        _delta({"content": '{"valid": true}'}, "stop"),
+    ])
+    assert asyncio.run(generation.model_json(
+        {"provider": "ollama", "model": "m"}, "s", {}, on_reasoning=lambda _text: None)) == {"valid": True}
+    assert requests[0]["stream"] is True
+    assert requests[0]["response_format"] == {"type": "json_object"}

@@ -102,7 +102,7 @@ def test_half_mark_candidate_and_export_roundtrip(client, monkeypatch):
     with service.database() as conn:
         conn.execute("UPDATE workspace_settings SET model='mock-model' WHERE id=1")
     count = 0
-    async def fake_question(_settings, plan, _sources, _feedback=''):
+    async def fake_question(_settings, plan, _sources, _feedback='', *, on_reasoning=None):
         nonlocal count
         count += 1
         assert plan.marks == 0.5

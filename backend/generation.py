@@ -193,49 +193,115 @@ def provider_details(settings: dict) -> tuple[str, dict]:
     return model_credentials(settings)
 
 
-async def model_json(settings: dict, system: str, request: dict, *, max_tokens: int = 4096) -> dict:
+async def _stream_answer(client, url: str, headers: dict, payload: dict,
+                         settings: dict, on_reasoning) -> tuple[str, str | None, bool]:
+    """Stream one completion, forwarding thinking deltas as they arrive.
+
+    Returns (final_answer_text, finish_reason, saw_reasoning). Thinking stays
+    enabled; the callback receives every reasoning delta so the UI can show
+    the model working while the JSON answer is assembled here.
+    """
+    body = payload
+    parts: list[str] = []
+    finish = None
+    saw_reasoning = False
+    while True:
+        async with client.stream("POST", url, headers=headers, json=body) as response:
+            if (response.status_code == 400 and body is payload
+                    and settings.get("provider") == "ollama"):
+                # Older Ollama versions / some models reject JSON mode; retry once.
+                body = {k: v for k, v in payload.items() if k != "response_format"}
+                continue
+            if response.is_error:
+                raise RuntimeError(f"Model provider returned HTTP {response.status_code}")
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    item = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                if "error" in item:
+                    raise RuntimeError("Model provider returned an error in the response stream")
+                choices = item.get("choices") or []
+                if not choices or not isinstance(choices[0], dict):
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    delta = {}
+                # OpenAI-compatible gateways name thinking deltas differently.
+                reasoning = (delta.get("reasoning_content") or delta.get("reasoning")
+                             or delta.get("thinking"))
+                if isinstance(reasoning, str) and reasoning:
+                    saw_reasoning = True
+                    on_reasoning(reasoning)
+                text = delta.get("content")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+            return "".join(parts), finish, saw_reasoning
+
+
+async def model_json(settings: dict, system: str, request: dict, *, max_tokens: int = 4096,
+                     on_reasoning=None) -> dict:
     """Request exam JSON; report safe provider diagnostics without leaking data/keys.
 
-    Compatibility options are scoped to Ollama. Other OpenAI-compatible gateways
-    may reject JSON mode or reasoning controls for a given model.
+    Compatibility options are scoped to Ollama. With on_reasoning (a sync
+    callable) the request streams so model thinking reaches the UI live;
+    without it a single buffered response is used. Thinking stays enabled in
+    both modes: reasoning tokens count toward max_tokens, so callers must
+    budget for them (see generate_question and exam_batch._budget).
     """
     url, headers = provider_details(settings)
-    payload = {"model": settings["model"], "stream": False, "max_tokens": max_tokens,
+    payload = {"model": settings["model"], "stream": on_reasoning is not None,
+               "max_tokens": max_tokens,
                "messages": [{"role": "system", "content": system + "\nRespond with one valid JSON object and no other text."},
                             {"role": "user", "content": json.dumps(request, ensure_ascii=False)}]}
     if settings.get("provider") == "ollama":
-        # Supported by Ollama's OpenAI-compatible /v1/chat/completions API.
-        # Avoid using up the whole output budget in Qwen-style thinking mode.
+        # JSON mode keeps the answer parseable; it does not disable thinking.
         payload["response_format"] = {"type": "json_object"}
-        payload["reasoning_effort"] = "none"
     timeout = httpx.Timeout(connect=8, read=90, write=20, pool=10)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        result = await client.post(url, headers=headers, json=payload)
-        if result.status_code == 400 and settings.get("provider") == "ollama":
-            # Older Ollama versions / some models reject these optional features.
-            # Revert to the baseline OpenAI-compatible request, once, rather
-            # than failing all question-generation attempts with HTTP 400.
-            fallback = {k: v for k, v in payload.items()
-                        if k not in {"response_format", "reasoning_effort"}}
-            result = await client.post(url, headers=headers, json=fallback)
-        if result.is_error:
-            raise RuntimeError(f"Model provider returned HTTP {result.status_code}")
-        try:
-            response = result.json()
-        except ValueError as exc:
-            raise ValueError("Model provider returned a non-JSON API response") from exc
-        if not isinstance(response, dict):
-            raise ValueError("Model provider returned an invalid API response")
-        choices = response.get("choices") or []
-        if not isinstance(choices, list) or not choices:
-            raise ValueError("Model returned no choices")
-        choice = choices[0]
-        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
-            raise ValueError("Model returned an invalid message")
-        message = choice["message"]
-        if isinstance(message.get("parsed"), dict):
-            return message["parsed"]
-        content = _completion_text(message)
+        if on_reasoning is not None:
+            content, finish, saw_reasoning = await _stream_answer(
+                client, url, headers, payload, settings, on_reasoning)
+            choice = {"finish_reason": finish,
+                      "message": {"reasoning_content": "(streamed)"} if saw_reasoning else {}}
+            response = {"usage": {}}
+        else:
+            result = await client.post(url, headers=headers, json=payload)
+            if result.status_code == 400 and settings.get("provider") == "ollama":
+                # Older Ollama versions / some models reject JSON mode.
+                # Revert to the baseline OpenAI-compatible request, once, rather
+                # than failing all question-generation attempts with HTTP 400.
+                fallback = {k: v for k, v in payload.items() if k != "response_format"}
+                result = await client.post(url, headers=headers, json=fallback)
+            if result.is_error:
+                raise RuntimeError(f"Model provider returned HTTP {result.status_code}")
+            try:
+                response = result.json()
+            except ValueError as exc:
+                raise ValueError("Model provider returned a non-JSON API response") from exc
+            if not isinstance(response, dict):
+                raise ValueError("Model provider returned an invalid API response")
+            choices = response.get("choices") or []
+            if not isinstance(choices, list) or not choices:
+                raise ValueError("Model returned no choices")
+            choice = choices[0]
+            if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+                raise ValueError("Model returned an invalid message")
+            message = choice["message"]
+            if isinstance(message.get("parsed"), dict):
+                return message["parsed"]
+            content = _completion_text(message)
+            finish = choice.get("finish_reason")
         if not content.strip():
             usage = response.get("usage") or {}
             if not isinstance(usage, dict):
@@ -244,14 +310,14 @@ async def model_json(settings: dict, system: str, request: dict, *, max_tokens: 
             logging.getLogger(__name__).warning(
                 "Question model returned no final text: provider=%s model=%s finish_reason=%s "
                 "completion_tokens=%s reasoning_tokens=%s",
-                settings.get("provider"), settings.get("model"), choice.get("finish_reason"),
+                settings.get("provider"), settings.get("model"), finish,
                 usage.get("completion_tokens"), details.get("reasoning_tokens") if isinstance(details, dict) else None,
             )
             raise ValueError(_empty_output_reason(choice, response))
         try:
             return parse_json(content)
         except (ValueError, json.JSONDecodeError) as exc:
-            if choice.get("finish_reason") == "length":
+            if finish == "length":
                 raise ValueError("Model exhausted its output token limit and returned incomplete JSON") from exc
             raise ValueError("Model returned malformed JSON: " + str(exc)[:180]) from exc
 
@@ -356,12 +422,13 @@ def validate_question(question: GeneratedQuestion, plan: QuestionPlan, sources: 
 
 
 async def generate_question(settings: dict, plan: QuestionPlan, sources: list[dict],
-                            previous_issue: str = "") -> GeneratedQuestion:
+                            previous_issue: str = "", *, on_reasoning=None) -> GeneratedQuestion:
     entries = [{"id": source["chunk_id"], "filename": source["filename"],
                 "page": source["page"], "section": source["section"],
                 "content": source["snippet"][:1100]} for source in sources]
-    # For a retry after output truncation, grant a larger completion budget.
-    output_budget = 8192 if "output token limit" in previous_issue else 4096
+    # Thinking models spend completion tokens on reasoning before any JSON, so
+    # budgets are generous; a truncation retry doubles the previous grant.
+    output_budget = 16384 if "output token limit" in previous_issue else 8192
     result = await model_json(settings,
         "Write ONE pedagogically sound exam question. Return only a JSON object with "
         "stem, options (four strings if MCQ; otherwise []), correct_answer (an exact "
@@ -374,7 +441,7 @@ async def generate_question(settings: dict, plan: QuestionPlan, sources: list[di
         "entire table on one line. Keep the four MCQ answers in options, not stem. "
         "Do not include the question marks or answer options inside stem.",
         {"plan": plan.model_dump(), "source_excerpts": entries, "repair_feedback": previous_issue},
-        max_tokens=output_budget)
+        max_tokens=output_budget, on_reasoning=on_reasoning)
     question = GeneratedQuestion.model_validate(result)
     validate_question(question, plan, sources)
     return question

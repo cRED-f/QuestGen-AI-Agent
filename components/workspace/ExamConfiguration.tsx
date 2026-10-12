@@ -15,6 +15,7 @@ export type ExamRequirements = {
   difficulty?: string;
   question_formats?: ExamFormat[];
   material_scope?: string;
+  topic_scope?: string;
 };
 export type ExamSession = {
   thread_id: string;
@@ -22,22 +23,23 @@ export type ExamSession = {
   requirements: ExamRequirements;
   document_ids: string[];
   context_summary: string;
+  next_question?: string | null;
   missing: string[];
   ready_for_approval: boolean;
   updated_at?: number;
 };
 
-const FIELDS = ["faculty_initials", "university_name", "exam_type", "total_marks", "difficulty", "question_formats", "material_scope"] as const;
+const FIELDS = ["faculty_initials", "university_name", "exam_type", "total_marks", "difficulty", "question_formats", "material_scope", "topic_scope"] as const;
 const LABELS: Record<string, string> = {
   faculty_initials: "Faculty initials", university_name: "University", exam_type: "Exam type",
-  total_marks: "Total marks", difficulty: "Difficulty", question_formats: "Question sections", material_scope: "Materials",
+  total_marks: "Total marks", difficulty: "Difficulty", question_formats: "Question sections", material_scope: "Materials", topic_scope: "Topic scope",
 };
 const QUESTION_TEXT: Record<string, string> = {
   faculty_initials: "First, what initials should I put beside the faculty name on the exam paper?",
   university_name: "Which university should appear on the question paper?",
   exam_type: "What kind of exam are we preparing?",
   total_marks: "How many marks should the entire paper be worth?",
-  difficulty: "How challenging would you like the questions to be?",
+  difficulty: "Do you have a difficulty preference? Otherwise I can infer complexity from the material.",
   question_formats: "How would you like to divide the marks between different question types?",
   material_scope: "Should I use your uploaded course materials or general knowledge?",
   document_ids: "Which of your uploaded documents should I use for this exam?",
@@ -191,7 +193,7 @@ export default function ExamConfiguration({ session, documents, selectedDocument
     <section className="qg-exam-assistant qg-exam-prompt-bubble" aria-label="QuestGen human-in-the-loop" aria-live={approved ? "off" : "polite"}>
       <div className="qg-exam-assistant-heading"><span className="qg-exam-assistant-avatar"><img src="/icon.svg" width={26} height={26} alt=""/></span><span>QuestGen</span>{busy && <Loader2 size={14} className="qg-spin" aria-label="Saving your answer"/>}</div>
       <div key={activeField || session?.status || "intro"} className="qg-exam-assistant-body qg-exam-prompt-reveal">
-        <p>{approved ? "Your exam configuration is approved. Let's build your paper together." : ready ? "Everything I need is here. Shall I use these details to prepare your exam paper?" : QUESTION_TEXT[activeField || ""] || "Tell me about the exam you'd like to prepare."}</p>
+        <p>{approved ? "Your exam configuration is approved. Let's build your paper together." : ready ? "Everything I need is here. Shall I use these details to prepare your exam paper?" : session?.next_question || QUESTION_TEXT[activeField || ""] || "Tell me about the exam you'd like to prepare."}</p>
       </div>
     </section>
     {controlsTarget ? createPortal(controls, controlsTarget) : null}

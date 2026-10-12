@@ -1,4 +1,4 @@
-"""Professor-controlled, one-candidate-at-a-time paper builder.
+"""Professor-controlled exam-paper builder with batch draft support.
 
 Each thread owns a durable blueprint, candidate, accepted questions and versions.
 Only explicit human actions modify the paper. Model calls never hold SQLite locks.
@@ -47,7 +47,7 @@ class Section(BaseModel):
     @model_validator(mode='after')
     def valid(self):
         to_cents(self.marks_each)
-        if self.kind not in exam_state.FORMATS or self.difficulty not in exam_state.DIFFICULTIES:
+        if self.kind not in exam_state.FORMATS or self.difficulty not in (*exam_state.DIFFICULTIES, 'auto'):
             raise ValueError('Unsupported section type or difficulty')
         return self
 
@@ -217,7 +217,7 @@ def _event(conn: sqlite3.Connection, thread_id: str, event: str, duration_ms: in
 
 def approve_final(conn: sqlite3.Connection, thread_id: str) -> dict:
     paper, session = _valid_paper(conn, thread_id, require_ready=True)
-    if paper['status'] != 'complete' or paper['candidate'] or paper['generation_token']:
+    if paper['status'] != 'complete' or paper['candidate'] or paper['generation_token'] or conn.execute('SELECT 1 FROM exam_paper_drafts WHERE thread_id=? LIMIT 1',(thread_id,)).fetchone():
         raise HTTPException(status_code=409, detail='Finish every question and resolve the candidate before final approval')
     slots = _validate_blueprint(Blueprint.model_validate_json(paper['blueprint']), session['requirements'])
     counts = [row['slot'] for row in conn.execute('SELECT slot FROM exam_paper_questions WHERE thread_id=?', (thread_id,))]
@@ -254,6 +254,8 @@ def read(conn: sqlite3.Connection, thread_id: str) -> dict | None:
         q['content'] = json.loads(q['content'])
     accepted = {q['slot'] for q in questions}
     paper['questions'] = questions
+    from backend import exam_batch
+    paper['drafts'] = exam_batch.drafts(conn, thread_id)
     paper['final_approved'] = (bool(paper['final_signature'] and paper['final_approved_at'])
         and paper['status'] == 'complete' and _revision_fingerprint(conn, dict(row)) == paper['final_signature'])
     paper['final_approved_at'] = paper['final_approved_at'] if paper['final_approved'] else None
@@ -307,11 +309,11 @@ def prepare(conn: sqlite3.Connection, thread_id: str) -> dict:
                 labels.append(label[:200])
     else:
         labels = []
-    default_topic = 'Course concepts selected by professor'
+    default_topic = req.get('topic_scope') or 'Course concepts selected by professor'
     sections = [Section(id=f'section-{i+1}', kind=f['kind'], count=f['count'], marks_each=f['marks_each'],
-                        topic=labels[i % len(labels)] if labels else default_topic, difficulty=req['difficulty'])
+                        topic=labels[i % len(labels)] if labels else default_topic, difficulty=req.get('difficulty', 'auto'))
                 for i, f in enumerate(req['question_formats'])]
-    blueprint = Blueprint(title=f"{req['university_name']} — {req['exam_type'].title()} Examination",
+    blueprint = Blueprint(title=f"{req.get('university_name', 'Course')} — {req.get('exam_type', 'custom').title()} Examination",
                           sections=sections)
     _validate_blueprint(blueprint, req)
     now = stamp()
@@ -322,6 +324,8 @@ def prepare(conn: sqlite3.Connection, thread_id: str) -> dict:
                  (thread_id, blueprint.model_dump_json(), signature(session), json.dumps(selected), now, now))
     # A changed configuration invalidates the whole draft; never silently reuse accepted questions.
     conn.execute('DELETE FROM exam_paper_questions WHERE thread_id=?', (thread_id,))
+    conn.execute('DELETE FROM exam_paper_drafts WHERE thread_id=?', (thread_id,))
+    conn.execute('DELETE FROM exam_paper_contexts WHERE thread_id=?', (thread_id,))
     conn.execute('DELETE FROM exam_candidate_history WHERE thread_id=?', (thread_id,))
     return read(conn, thread_id)
 
@@ -331,6 +335,7 @@ def change_blueprint(conn: sqlite3.Connection, thread_id: str, value: Blueprint)
     if paper['status'] != 'awaiting_approval':
         raise HTTPException(status_code=409, detail='Cannot edit an approved blueprint; change requirements and create a new draft')
     _validate_blueprint(value, session['requirements'])
+    conn.execute('DELETE FROM exam_paper_contexts WHERE thread_id=?', (thread_id,))
     conn.execute('UPDATE exam_papers SET blueprint=?,updated_at=? WHERE thread_id=?',
                  (value.model_dump_json(), stamp(), thread_id))
     return read(conn, thread_id)
@@ -554,7 +559,7 @@ def versions(conn: sqlite3.Connection, thread_id: str, question_id: str) -> list
             for q in conn.execute('SELECT version,action,created_at FROM exam_paper_versions WHERE question_id=? ORDER BY version DESC', (question_id,))]
 
 
-async def generate_next(thread_id: str, *, regenerate: bool = False) -> dict:
+async def generate_next(thread_id: str, *, regenerate: bool = False, on_reasoning=None) -> dict:
     from backend.app import database, model_credentials
     # Atomic reservation ensures a double-click never generates two candidates.
     with database() as conn:
@@ -605,9 +610,11 @@ async def generate_next(thread_id: str, *, regenerate: bool = False) -> dict:
         else:
             sources = documents.retrieve(session['course_id'], slot['topic'], 6, selected)
         kinds = {'long_answer': 'long_answer', 'custom': 'custom'}
+        from backend.exam_context import complexity
+        level, cognitive = complexity(slot, session['requirements'].get('exam_type', 'custom'))
         plan = generation.QuestionPlan(topic=slot['topic'], kind=kinds.get(slot['kind'], slot['kind']),
-                                       difficulty={'hard++':'hard','complex':'hard','moderate':'medium','easy':'easy'}[slot['difficulty']],
-                                       bloom_level='analyze' if slot['difficulty'] in ('hard++','complex') else 'apply' if slot['difficulty']=='moderate' else 'understand',
+                                       difficulty={'hard++':'hard','complex':'hard','moderate':'medium','easy':'easy'}[level],
+                                       bloom_level=cognitive,
                                        marks=slot['marks'])
         feedback = ('Use ONLY the supplied excerpts from ' + slot['topic'] +
                     '. Cite at least one supplied chunk ID and do not reuse the previous chapter.\n' if source_override else '') + 'Do not repeat any of these previously rejected or proposed questions: ' + json.dumps((accepted_stems + history)[-30:])
@@ -616,7 +623,8 @@ async def generate_next(thread_id: str, *, regenerate: bool = False) -> dict:
         for _ in range(generation.MAX_ATTEMPTS):
             try:
                 question = await asyncio.wait_for(
-                    generation.generate_question(settings, plan, sources, feedback),
+                    generation.generate_question(settings, plan, sources, feedback,
+                                                 on_reasoning=on_reasoning),
                     timeout=GENERATION_TIMEOUT_SECONDS)
                 normalized = re.sub(r'\s+', ' ', question.stem).strip().casefold()
                 if any(re.sub(r'\s+', ' ', h).strip().casefold() == normalized for h in history):

@@ -472,12 +472,12 @@ def export_interactive_paper(conn: sqlite3.Connection, thread_id: str,
         doc.sections[0].top_margin = Inches(0.75)
         doc.sections[0].bottom_margin = Inches(0.75)
         doc.styles['Normal'].font.size = Pt(10.5)
-        header = doc.add_paragraph(req['university_name'])
+        header = doc.add_paragraph(req.get('university_name') or 'Course Examination')
         header.alignment = WD_ALIGN_PARAGRAPH.CENTER
         header.runs[0].bold = True
         heading = doc.add_heading(title, level=1)
         heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        doc.add_paragraph(f"{req['exam_type'].title()} | Faculty: {req['faculty_initials']} | Full marks: {display(paper['total_marks'])}")
+        doc.add_paragraph(f"{req['exam_type'].title()} | Faculty: {req.get('faculty_initials') or 'Not specified'} | Full marks: {display(paper['total_marks'])}")
         doc.add_paragraph(blueprint['instructions'])
         if audience == 'instructor':
             doc.add_paragraph('INSTRUCTOR COPY - ANSWERS AND EXPLANATIONS')
@@ -516,9 +516,9 @@ def export_interactive_paper(conn: sqlite3.Connection, thread_id: str,
         centered = styles['Heading2'].clone('QuestGenCentered')
         centered.alignment = TA_CENTER
         output = io.BytesIO()
-        story = [Paragraph(escape(req['university_name']), centered),
+        story = [Paragraph(escape(req.get('university_name') or 'Course Examination'), centered),
                  Paragraph(escape(title), styles['Title']),
-                 Paragraph(escape(f"{req['exam_type'].title()} | Faculty: {req['faculty_initials']} | Full marks: {display(paper['total_marks'])}"), styles['Normal']),
+                 Paragraph(escape(f"{req['exam_type'].title()} | Faculty: {req.get('faculty_initials') or 'Not specified'} | Full marks: {display(paper['total_marks'])}"), styles['Normal']),
                  Spacer(1, 10), Paragraph(escape(blueprint['instructions']), styles['Normal'])]
         if audience == 'instructor':
             story.append(Paragraph('INSTRUCTOR COPY - ANSWERS AND EXPLANATIONS', styles['Heading3']))

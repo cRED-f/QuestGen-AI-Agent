@@ -199,7 +199,7 @@ function ListItem({ children }: { children?: ReactNode }) {
   const items = Children.toArray(children);
   const first = items[0];
   const match = typeof first === "string" ? /^\[([ xX])\]\s*/.exec(first) : null;
-  if (!match) return <li>{inlineStrike(children)}</li>;
+  if (!match || typeof first !== "string") return <li>{inlineStrike(children)}</li>;
   return <li className="qg-task-item">
     <input type="checkbox" checked={match[1].toLowerCase() === "x"} readOnly aria-label={match[1].toLowerCase() === "x" ? "Completed item" : "Incomplete item"}/>
     <span>{inlineStrike([first.slice(match[0].length), ...items.slice(1)])}</span>

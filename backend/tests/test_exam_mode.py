@@ -38,7 +38,7 @@ def test_exam_bootstrap_and_history_are_shared(client):
                      (service.identifier(), tid, 'Our graph algorithms midterm should cover shortest paths.', service.now()))
     session = client.post(f'/api/threads/{tid}/exam/start').json()
     assert session['status'] == 'collecting'
-    assert session['missing'][0] == 'faculty_initials'
+    assert session['missing'][0] == 'exam_type'
     assert 'graph algorithms' in session['context_summary']
     assert client.get(f'/api/threads/{tid}/exam').json()['context_summary'] == session['context_summary']
     assert client.get(f'/api/threads/{tid}/messages').json()[0]['mode'] == 'chat'
@@ -48,17 +48,17 @@ def test_exam_bootstrap_and_history_are_shared(client):
 def test_stepwise_exam_turn_survives_backend_reinitialization(client):
     tid = make_thread(client)
     client.post(f'/api/threads/{tid}/exam/start')
-    result = client.post(f'/api/threads/{tid}/exam/turn', json={'content': 'FI'})
+    result = client.post(f'/api/threads/{tid}/exam/turn', json={'content': 'midterm'})
     assert result.status_code == 200, result.text
-    assert result.json()['session']['requirements']['faculty_initials'] == 'FI'
-    assert 'university' in result.json()['reply'].lower()
-    response = client.post(f'/api/threads/{tid}/exam/turn', json={'content': 'Example University'})
-    assert response.json()['session']['requirements']['university_name'] == 'Example University'
-    assert 'assessment type' in response.json()['reply'].lower()
+    assert result.json()['session']['requirements']['exam_type'] == 'midterm'
+    assert 'mark' in result.json()['reply'].lower()
+    response = client.post(f'/api/threads/{tid}/exam/turn', json={'content': '40 marks'})
+    assert response.json()['session']['requirements']['total_marks'] == 40
+    assert 'question' in response.json()['reply'].lower()
     service.init_db()  # simulate schema initialization at restart
     restored = client.get(f'/api/threads/{tid}/exam').json()
-    assert restored['requirements']['faculty_initials'] == 'FI'
-    assert restored['requirements']['university_name'] == 'Example University'
+    assert restored['requirements']['exam_type'] == 'midterm'
+    assert restored['requirements']['total_marks'] == 40
     messages = client.get(f'/api/threads/{tid}/messages').json()
     assert [m['role'] for m in messages] == ['user', 'assistant', 'user', 'assistant']
     assert all(m['mode'] == 'exam' for m in messages)
@@ -75,8 +75,8 @@ def test_multi_field_model_tool_calls_and_no_repeat_questions(client, monkeypatc
     result = client.post(f'/api/threads/{tid}/exam/turn', json={
         'content': 'I am FI at Example University preparing a 40 mark midterm'})
     assert result.status_code == 200
-    assert result.json()['session']['missing'][0] == 'difficulty'
-    assert 'difficulty' in result.json()['reply'].lower()
+    assert result.json()['session']['missing'][0] == 'question_formats'
+    assert 'question' in result.json()['reply'].lower()
     with service.database() as conn:
         assert conn.execute("SELECT COUNT(*) FROM exam_tool_events WHERE thread_id=? AND tool_name='save_exam_requirements'", (tid,)).fetchone()[0] == 1
 
@@ -110,7 +110,11 @@ def test_approved_configuration_revoked_when_edited(client):
     assert client.post(f'/api/threads/{tid}/generations', json={
         'prompt': 'Generate the final paper'}).status_code == 409
     cleared = client.patch(base + '/requirements', json={'updates': {'university_name': None}}).json()
-    assert 'university_name' in cleared['missing']
+    assert 'university_name' not in cleared['missing']  # Institution is optional.
+    assert client.post(base + '/approve').status_code == 200
+    # Material requirements, unlike display metadata, remain mandatory.
+    invalid = client.patch(base + '/requirements', json={'updates': {'total_marks': None}}).json()
+    assert 'total_marks' in invalid['missing']
     assert client.post(base + '/approve').status_code == 409
 
 
@@ -208,10 +212,10 @@ def test_quick_replies_advance_one_question_and_persist_as_messages(client):
     base = f'/api/threads/{tid}/exam'
     assert client.post(base + '/start').status_code == 200
     choices = [
-        ({'faculty_initials': 'FI'}, 'FI', 'university_name'),
+        ({'faculty_initials': 'FI'}, 'FI', 'exam_type'),
         ({'university_name': 'Example University'}, 'Example University', 'exam_type'),
         ({'exam_type': 'midterm'}, 'Midterm', 'total_marks'),
-        ({'total_marks': 40}, '40 marks', 'difficulty'),
+        ({'total_marks': 40}, '40 marks', 'question_formats'),
         ({'difficulty': 'moderate'}, 'Moderate', 'question_formats'),
         ({'question_formats': [{'kind': 'mcq', 'count': 10, 'marks_each': 1},
                                {'kind': 'short_answer', 'count': 6, 'marks_each': 5}]},

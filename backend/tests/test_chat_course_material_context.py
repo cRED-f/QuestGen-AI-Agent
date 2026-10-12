@@ -82,7 +82,7 @@ def test_selected_materials_remain_strictly_scoped(client, monkeypatch):
     second = upload_deck(client, cid, "economics.pptx", "Market equilibrium relates price and demand")
     tid = client.post("/api/threads", json={"course_id": cid}).json()["id"]
     observed = []
-    async def fake_generate(_settings, history):
+    async def fake_generate(_settings, history, **_kwargs):
         observed.append(history)
         yield "Ready."
     monkeypatch.setattr(service, "generate_tokens", fake_generate)
@@ -154,7 +154,7 @@ def test_explain_chapter_3_reads_full_deck_not_only_lexical_hits(client, monkeyp
     assert {source["page"] for source in sources} == set(range(1, 48))
     assert {source["document_id"] for source in sources} == {first}
     prompt = "\n".join(item["content"] for item in inputs[-1][0])
-    assert inputs[-1][1]["max_tokens"] == 3200
+    assert inputs[-1][1]["max_tokens"] == 8192
     assert "Slide 3: topic-specific" in prompt
     assert "Slide 20: topic-specific" in prompt
     assert "Slide 47: topic-specific" in prompt
@@ -203,3 +203,40 @@ def test_named_deck_request_never_fetches_unselected_deck(client, monkeypatch):
     assert all(source["document_id"] == selected for source in sources)
     assert "Private course source" not in calls[-1]
     assert "microeconomic markets" not in calls[-1]
+
+def test_overall_explanation_of_named_deck_reads_full_deck(client, monkeypatch):
+    """The professor phrasing 'overall explanation of Ch 3 PPT' must read the deck."""
+    cid = client.get("/api/courses").json()[0]["id"]
+    deck = upload_multislide_deck(client, cid, "Ch 3 PPT.pptx", 8)
+    upload_deck(client, cid, "Chapter 02 PPT.pptx", "An entirely different lesson")
+    tid = client.post("/api/threads", json={"course_id": cid}).json()["id"]
+    calls = []
+    async def fake_generate(_settings, history, **_kwargs):
+        calls.append(str(history))
+        yield "Response."
+    monkeypatch.setattr(service, "generate_tokens", fake_generate)
+    result = events(client.post(f"/api/threads/{tid}/stream", json={
+        "content": "Give an overall explanation of Ch 3 PPT",
+    }))
+    sources = next(e for e in result if e["type"] == "sources")["sources"]
+    assert len(sources) == 8
+    assert {source["document_id"] for source in sources} == {deck}
+    assert "Whole-document explanation" in calls[-1]
+    assert "An entirely different lesson" not in calls[-1]
+
+def test_non_overview_question_naming_deck_still_reads_it(client, monkeypatch):
+    """Even without overview phrasing, naming a deck must not leave empty context."""
+    cid = client.get("/api/courses").json()[0]["id"]
+    deck = upload_deck(client, cid, "Ch 3 PPT.pptx", "Dijkstra shortest paths relax edges")
+    tid = client.post("/api/threads", json={"course_id": cid}).json()["id"]
+    calls = []
+    async def fake_generate(_settings, history, **_kwargs):
+        calls.append(str(history))
+        yield "Response."
+    monkeypatch.setattr(service, "generate_tokens", fake_generate)
+    result = events(client.post(f"/api/threads/{tid}/stream", json={
+        "content": "Tell me what matters in Ch 3 PPT",
+    }))
+    sources = next(e for e in result if e["type"] == "sources")["sources"]
+    assert sources and all(source["document_id"] == deck for source in sources)
+    assert "Dijkstra" in calls[-1]

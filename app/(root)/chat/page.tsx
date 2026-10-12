@@ -99,7 +99,7 @@ const PROVIDERS: { value: ModelSettings["provider"]; label: string; detail: stri
   { value: "ollama", label: "Ollama", detail: "Models installed locally" },
 ];
 type ChatEvent = {
-  type: "started" | "sources" | "delta" | "done" | "error";
+  type: "started" | "sources" | "delta" | "reasoning" | "done" | "error";
   sources?: Source[];
   user_id?: string;
   message_id?: string;
@@ -203,6 +203,8 @@ export default function ChatPage() {
   const [hitlActionsTarget, setHitlActionsTarget] = useState<HTMLDivElement | null>(null);
   const [activityExpanded, setActivityExpanded] = useState<Record<string, boolean>>({});
   const [assistantActivity, setAssistantActivity] = useState<Record<string, {started: number; visibleChars: number; done?: boolean}>>({});
+  // Streamed model thinking, keyed by message id; display-only, never persisted.
+  const [assistantReasoning, setAssistantReasoning] = useState<Record<string, string>>({});
   const [activityNow, setActivityNow] = useState(() => Date.now());
 
   const [workspaceMode, setWorkspaceMode] = useState<"chat" | "exam">("chat");
@@ -210,6 +212,7 @@ export default function ChatPage() {
   const [examSession, setExamSession] = useState<ExamSession | null>(null);
   const [examBusy, setExamBusy] = useState(false);
   const [examPaper, setExamPaper] = useState<ExamPaper | null>(null);
+  const [examReasoning, setExamReasoning] = useState("");
   const [paperBusy, setPaperBusy] = useState(false);
   const paperAbortRef = useRef<AbortController | null>(null);
   const [assessment, setAssessment] = useState<AssessmentJob | null>(null);
@@ -678,12 +681,13 @@ export default function ChatPage() {
     if (!threadId || paperBusy || examBusy) return;
     setPaperBusy(true);
     setError("");
-    const generating = path === "/next" || path === "/regenerate";
+    const generating = path === "/next" || path === "/regenerate" || path === "/batch" || path === "/batch/revise";
     const abort = generating ? new AbortController() : null;
     if (generating) {
       paperAbortRef.current = abort;
       setExamPaper(old => old ? {...old, status: "generating"} : old);
     }
+    let reasoningSource: EventSource | null = null;
     try {
       if (generating) {
         // Model calls can take minutes. Start the job with a quick 202 response,
@@ -691,11 +695,25 @@ export default function ChatPage() {
         const start = await requestJson<ExamGenerationStatus>(
           `/threads/${threadId}/exam/paper/generation/start`, {
             method: "POST",
-            body: JSON.stringify({regenerate: path === "/regenerate", ...(body && typeof body === "object" ? body : {})}),
+            body: JSON.stringify({regenerate: path === "/regenerate",
+              mode: path === "/batch" ? "batch" : path === "/batch/revise" ? "revision" : "single",
+              ...(body && typeof body === "object" ? body : {})}),
             signal: abort?.signal,
           },
         );
         if (!start.request_id) throw new Error("QuestGen did not return a generation request ID.");
+        setExamReasoning("");
+        reasoningSource = new EventSource(`${API}/threads/${threadId}/exam/paper/generation/${start.request_id}/events`);
+        reasoningSource.onmessage = messageEvent => {
+          try {
+            const event = JSON.parse(messageEvent.data) as { type?: string; content?: string };
+            if (event.type === "reasoning") {
+              setExamReasoning(previous => (previous + (event.content || "")).slice(-6000));
+            } else if (event.type === "complete") {
+              reasoningSource?.close();
+            }
+          } catch { /* Skip malformed frames; the stream stays open. */ }
+        };
         while (!abort?.signal.aborted) {
           await new Promise(resolve => setTimeout(resolve, 1000));
           if (abort?.signal.aborted) break;
@@ -722,6 +740,7 @@ export default function ChatPage() {
       // A timed-out request may have completed server-side; read the authoritative state.
       await refreshExamPaper(threadId).catch(() => {});
     } finally {
+      reasoningSource?.close();
       if (paperAbortRef.current === abort) paperAbortRef.current = null;
       setPaperBusy(false);
     }
@@ -1094,6 +1113,10 @@ export default function ChatPage() {
           setMessages((previous) => previous.map((item) => item.id === answer.id
             ? { ...item, sources: event.sources || [] } : item));
         }
+        if (event.type === "reasoning") {
+          setAssistantReasoning(previous => ({...previous, [answer.id]:
+            ((previous[answer.id] || "") + (event.content || "")).slice(0, 12000)}));
+        }
         if (event.type === "delta") {
           setAssistantActivity(previous => ({...previous, [answer.id]: {
             started: timestamp, visibleChars: (previous[answer.id]?.visibleChars || 0) + (event.content || "").length,
@@ -1106,6 +1129,8 @@ export default function ChatPage() {
             started: timestamp, visibleChars: previous[answer.id]?.visibleChars || 0, done: true,
           }}));
           setActivityExpanded(previous => ({...previous, [event.message_id!]: previous[answer.id] !== false}));
+          setAssistantReasoning(previous => previous[answer.id] === undefined ? previous
+            : {...previous, [event.message_id!]: previous[answer.id]});
           setMessages((previous) => previous.map((item) => item.id === answer.id ? { ...item, id: event.message_id! } : item));
         }
       });
@@ -1433,11 +1458,16 @@ export default function ChatPage() {
                               const visibleTokens = Math.ceil((stats?.visibleChars ?? message.content.length) / 4);
                               const elapsed = stats ? (Math.max(0, activityNow - stats.started) / 1000).toFixed(1) : "0.0";
                               const expanded = activityExpanded[message.id] !== false;
+                              const reasoningText = assistantReasoning[message.id] || "";
                               return <div className="qg-ai-activity">
                                 <button type="button" className="qg-ai-activity-toggle" aria-expanded={expanded} onClick={() => setActivityExpanded(old => ({...old, [message.id]: !expanded}))}>
                                   <Activity size={13}/> {isPending ? "Generating response" : "Response activity"} <span>~{visibleTokens} output tokens</span> {isPending && <span>{elapsed}s</span>} {expanded ? <ChevronDown size={13}/> : <ChevronRight size={13}/>}
                                 </button>
-                                {expanded && <div className="qg-ai-activity-detail">{isPending ? "Searching context and preparing an answer…" : "Response completed."} Token count is an estimate of visible output, not private model reasoning.</div>}
+                                {expanded && <div className="qg-ai-activity-detail">
+                                  {reasoningText && <div className="qg-ai-reasoning">{reasoningText}</div>}
+                                  {isPending ? (reasoningText ? "Model is thinking…" : "Searching context and preparing an answer…") : "Response completed."}{" "}
+                                  {reasoningText ? "Token count is an estimate of visible output; the text above is streamed model reasoning." : "Token count is an estimate of visible output, not private model reasoning."}
+                                </div>}
                               </div>;
                             })()}
                             {message.content ? <FormattedMessage content={message.content}/> : <span className="qg-thinking"><Loader2 size={15} className="qg-spin"/> QuestGen is preparing a response…</span>}
@@ -1565,6 +1595,7 @@ export default function ChatPage() {
                 controlsTarget={hitlActionsTarget}>
                 {examIntroConfirmed && examSession.status === "approved" && <ExamPaperBuilder
                   paper={examPaper} requirements={examSession.requirements} busy={paperBusy || examBusy}
+                  reasoning={examReasoning}
                   onPrepare={() => paperAction("/prepare")}
                   onChangeBlueprint={(blueprint: PaperBlueprint) => paperAction("/blueprint", "PUT", { blueprint })}
                   onApproveBlueprint={() => paperAction("/approve")}
@@ -1573,6 +1604,14 @@ export default function ChatPage() {
                   onRegenerate={() => paperAction("/regenerate", "POST", { candidate_id: examPaper?.candidate_id })}
                   onSkip={() => paperAction("/skip", "POST", { candidate_id: examPaper?.candidate_id })}
                   onEditCandidate={(changes: QuestionEdits) => paperAction("/candidate", "PATCH", { candidate_id: examPaper?.candidate_id, ...changes })}
+                  onBatch={() => paperAction("/batch")}
+                  onReviseBatch={(draft_ids, instructions) => paperAction("/batch/revise", "POST", {draft_ids, instructions})}
+                  onChooseDraft={(draft_id, decision, version) => paperAction("/drafts/decision", "PUT", {draft_id,decision,version})}
+                  onEditDraft={(draft_id, version, changes) => paperAction(`/drafts/${draft_id}`, "PATCH", {version,...changes})}
+                  onApproveDrafts={(drafts) => paperAction("/drafts/approve", "POST", {
+                    draft_ids: drafts.map(d => d.id),
+                    expected_versions: Object.fromEntries(drafts.map(d => [d.id,d.version])),
+                  })}
                   onCancelGeneration={cancelPaperGeneration}
                 />}
               </ExamConfiguration>}

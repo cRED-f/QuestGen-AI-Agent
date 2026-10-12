@@ -58,7 +58,7 @@ def test_one_candidate_at_a_time_and_durable_paper(client, monkeypatch):
     request(client, 'POST', root + '/paper/approve')
     counter = {'n': 0}
 
-    async def generate(_settings, plan, _sources, _feedback=''):
+    async def generate(_settings, plan, _sources, _feedback='', *, on_reasoning=None):
         counter['n'] += 1
         return generation.GeneratedQuestion(
             stem=f'Question {counter["n"]} about {plan.topic} and its applications?',
@@ -144,7 +144,7 @@ def test_40_mark_essay_generates_after_approved_blueprint(client, monkeypatch):
     assert client.post(root + '/paper/prepare').status_code == 200
     assert client.post(root + '/paper/approve').status_code == 200
 
-    async def generate(_settings, plan, _sources, _feedback=''):
+    async def generate(_settings, plan, _sources, _feedback='', *, on_reasoning=None):
         assert plan.marks == 40
         return generation.GeneratedQuestion(
             stem='Explain this concept with relevant examples and a detailed argument.',

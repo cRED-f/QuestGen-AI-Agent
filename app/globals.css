@@ -806,7 +806,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .qg-export-grid button { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 9px 5px; border: 1px solid #bfccbe; border-radius: 8px; font-size: 11px; }
 .qg-export-grid button:hover:enabled { background: #edf5ea; }
 .qg-export-grid button:disabled { opacity: .48; cursor: not-allowed; }
-.qg-generation-status { display: flex; gap: 9px; align-items: center; font-size: 12px; }
+.qg-generation-status { display: flex; gap: 9px; align-items: center; font-size: 12px; flex-wrap: wrap; }
+.qg-reasoning { flex-basis: 100%; margin-top: 4px; font-size: 11px; color: var(--qg-muted); }
+.qg-reasoning summary { cursor: pointer; font-weight: 650; color: var(--qg-ink); }
+.qg-reasoning-body { white-space: pre-wrap; max-height: 170px; overflow-y: auto; line-height: 1.55; margin-top: 6px; border-top: 1px solid var(--qg-border); padding-top: 7px; }
 .qg-generation-status button { margin-left: auto; border: 1px solid #d6dcda; border-radius: 8px; padding: 7px 9px; }
 
 
@@ -1233,6 +1236,7 @@ html[data-theme="dark"] .qg-exam-choice-option > svg { color: #c8d8c2; }
 .qg-ai-activity-toggle > span { color: var(--qg-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .qg-ai-activity-toggle > svg:last-child { margin-left: auto; }
 .qg-ai-activity-detail { border-top: 1px solid var(--qg-border); padding-top: 7px; margin-top: 7px; font-size: 11px; line-height: 1.55; }
+.qg-ai-reasoning { white-space: pre-wrap; max-height: 220px; overflow-y: auto; margin-bottom: 7px; color: var(--qg-muted); }
 
 /* HITL: message stays in the assistant bubble; interactive tools dock to the composer. */
 .qg-exam-prompt-bubble { margin-bottom: 5px; max-height: 130px; overflow-y: auto; }
@@ -1284,3 +1288,10 @@ html[data-theme="dark"] .qg-exam-choice-option > svg { color: #c8d8c2; }
 @media (prefers-reduced-motion: reduce) { .qg-scroll-latest, .qg-paper-meter span { transition: none !important; } }
 @media(max-width:850px) { .qg-scroll-latest { bottom: 215px; } }
 .qg-error-retry { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; white-space: nowrap; font-size: 11px; font-weight: 700; border: 1px solid currentColor; border-radius: 7px; padding: 5px 8px; }
+
+/* Editable batch-generation review uses the existing QuestGen exam visual system. */
+.qg-batch-drafts { display: grid; gap: 1rem; margin: 1.2rem 0; }
+.qg-batch-draft { border: 1px solid var(--qg-border, rgba(128,128,128,.22)); border-radius: 14px; padding: 1rem; min-width: 0; }
+.qg-batch-draft .qg-paper-actions { flex-wrap: wrap; margin-top: .8rem; }
+.qg-batch-revision { display: grid; gap: .8rem; border-top: 1px solid rgba(128,128,128,.2); padding-top: 1rem; }
+.qg-batch-revision textarea { display: block; min-height: 85px; width: 100%; margin-top: .5rem; }

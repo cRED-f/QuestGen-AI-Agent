@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import pytest
@@ -52,7 +53,7 @@ def await_status(client, base, request_id, expected, timeout=3):
 def test_generation_start_is_nonblocking_and_double_click_safe(client, monkeypatch):
     base = prepared_exam(client, monkeypatch)
 
-    async def slow_generate(_settings, _plan, _sources, _feedback=''):
+    async def slow_generate(_settings, _plan, _sources, _feedback='', *, on_reasoning=None):
         await asyncio.sleep(0.4)
         return generation.GeneratedQuestion(
             stem='Which graph traversal uses a queue data structure?',
@@ -81,7 +82,7 @@ def test_generation_start_is_nonblocking_and_double_click_safe(client, monkeypat
 def test_generation_failure_returns_readable_error_and_retry_works(client, monkeypatch):
     base = prepared_exam(client, monkeypatch)
 
-    async def cannot_reach(_settings, _plan, _sources, _feedback=''):
+    async def cannot_reach(_settings, _plan, _sources, _feedback='', *, on_reasoning=None):
         raise HTTPException(status_code=503, detail='The model provider is unavailable. Check Ollama.')
 
     monkeypatch.setattr(generation, 'generate_question', cannot_reach)
@@ -97,7 +98,7 @@ def test_generation_failure_returns_readable_error_and_retry_works(client, monke
 def test_cancellation_invalidates_generation_and_preserves_paper(client, monkeypatch):
     base = prepared_exam(client, monkeypatch)
 
-    async def slow_generate(_settings, _plan, _sources, _feedback=''):
+    async def slow_generate(_settings, _plan, _sources, _feedback='', *, on_reasoning=None):
         await asyncio.sleep(3)
         raise AssertionError('The cancelled model must not write a new candidate')
 
@@ -163,7 +164,7 @@ def test_empty_provider_answer_is_retried_and_candidate_saved(client, monkeypatc
     base = prepared_exam(client, monkeypatch)
     attempts = []
 
-    async def model_reply(_settings, _system, _request, *, max_tokens=4096):
+    async def model_reply(_settings, _system, _request, *, max_tokens=4096, on_reasoning=None):
         attempts.append(max_tokens)
         if len(attempts) == 1:
             raise ValueError('Model exhausted its output token limit before returning JSON')
@@ -180,4 +181,37 @@ def test_empty_provider_answer_is_retried_and_candidate_saved(client, monkeypatc
     assert request.status_code == 202, request.text
     result = await_status(client, base, request.json()['request_id'], 'succeeded')
     assert result['paper']['candidate']['correct_answer'] == 'Breadth-first search'
-    assert attempts == [4096, 8192]
+    assert attempts == [8192, 16384]
+
+
+def test_exam_reasoning_streams_over_sse(client, monkeypatch):
+    """Live model thinking reaches the browser while the candidate is drafted."""
+    base = prepared_exam(client, monkeypatch)
+
+    async def model_reply(_settings, _system, _request, *, max_tokens=4096, on_reasoning=None):
+        if on_reasoning:
+            on_reasoning('Sorting candidate answers by cost…')
+            on_reasoning(' Choosing breadth-first search.')
+        return {
+            'stem': 'Which graph search algorithm uses a FIFO queue?',
+            'options': ['Breadth-first search', 'Depth-first search', 'Kruskal', 'Prim'],
+            'correct_answer': 'Breadth-first search',
+            'explanation': 'Breadth-first search uses FIFO processing of the frontier.',
+            'source_ids': [],
+        }
+
+    monkeypatch.setattr(generation, 'model_json', model_reply)
+    request = client.post(base + '/generation/start', json={})
+    assert request.status_code == 202, request.text
+    request_id = request.json()['request_id']
+    assert await_status(client, base, request_id, 'succeeded')['paper']['candidate']
+    thread_id = base.split('/')[3]
+    events = []
+    with client.stream('GET',
+                       f'/api/threads/{thread_id}/exam/paper/generation/{request_id}/events') as response:
+        assert response.status_code == 200, response.read()
+        for line in response.iter_lines():
+            if line.startswith('data: '):
+                events.append(json.loads(line[6:]))
+    assert [event['type'] for event in events] == ['reasoning', 'reasoning', 'complete']
+    assert 'breadth-first' in events[1]['content']

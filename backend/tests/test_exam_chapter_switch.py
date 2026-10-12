@@ -52,7 +52,7 @@ def setup(client, scope='all_course', selected=None):
 
 
 def generate_mock(monkeypatch, calls):
-    async def fake_gen(settings, plan, sources, previous_issue=''):
+    async def fake_gen(settings, plan, sources, previous_issue='', *, on_reasoning=None):
         calls.append((plan.topic, [s['filename'] for s in sources], previous_issue))
         return generation.GeneratedQuestion(
             stem=f"What is a concept in {plan.topic} question {len(calls)}?",

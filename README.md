@@ -16,9 +16,9 @@ Switch seamlessly between **Chat** and **Exam** modes within the same conversati
 
 **Chat Mode** supports general AI conversations and document-based discussions.
 
-**Exam Mode** provides an interactive, human-in-the-loop exam generator with step-by-step configuration, customizable question distributions, difficulty levels, chapter selection, and professor approval. Generate questions one at a time with **Accept, Regenerate, Edit, and Skip** options.
+**Exam Mode** uses adaptive clarifications (only for missing essential requirements), approved mixed-question blueprints, and syllabus-aware context engineering. A bounded Deep Agents planner may infer topic coverage and complexity from the course materials; if unsupported it falls back to a deterministic plan. Professors do not have to specify difficulty. One batch-writer request is attempted for all planned questions; oversized/invalid JSON automatically falls back to smaller groups. Drafts support **Keep, Edit, Revise, and Approve kept**; targeted regeneration never overwrites other drafts or approved questions. The original one-question flow remains available through the existing API.
 
-A live exam-paper sidebar displays selected questions, marks, and progress, with editing, reordering, and removal controls. All progress is saved automatically, and approved papers can be exported as **PDF or DOCX**.
+A live exam-paper sidebar displays approved questions, marks, and progress, with editing, reordering, and removal controls. All progress is saved automatically, and approved papers can be exported as **PDF or DOCX**.
 
 ## Current features
 
@@ -125,6 +125,11 @@ Anthropic generation currently uses an OpenAI-compatible API path, while model d
 #### Interactive paper API
 
 - `GET /api/threads/{thread_id}/exam/paper` — restore the paper, candidate and accepted questions.
+- `POST /api/threads/{thread_id}/exam/paper/generation/start` with `{ "mode": "batch" }` — generate all missing questions in one logical operation; model output-size fallback is automatic.
+- Same endpoint with `{ "mode": "revision", "draft_ids": ["..."], "instructions": "Make these more analytical" }` — regenerate only drafts previously flagged for revision.
+- `PUT /api/threads/{thread_id}/exam/paper/drafts/decision` — mark a draft Keep or Revise with a version check.
+- `PATCH /api/threads/{thread_id}/exam/paper/drafts/{draft_id}` — edit a draft, preserving history.
+- `POST /api/threads/{thread_id}/exam/paper/drafts/approve` — atomically accept selected kept drafts; other questions are untouched.
 - `POST /api/threads/{thread_id}/exam/paper/prepare` — prepare a syllabus-aware section blueprint.
 - `PUT /api/threads/{thread_id}/exam/paper/blueprint` — revise title, topic and difficulty without changing approved marks.
 - `POST /api/threads/{thread_id}/exam/paper/approve` — approve the blueprint.

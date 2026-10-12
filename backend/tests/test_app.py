@@ -70,3 +70,24 @@ def test_no_key_does_not_persist_failed_request(client, monkeypatch):
     thread_id = client.post("/api/threads", json={"course_id": client.get("/api/courses").json()[0]["id"]}).json()["id"]
     assert client.post(f"/api/threads/{thread_id}/stream", json={"content": "Hello"}).status_code == 422
     assert client.get(f"/api/threads/{thread_id}/messages").json() == []
+
+
+def test_stream_surfaces_model_reasoning_without_saving_it(client, monkeypatch):
+    """Thinking-model reasoning arrives as SSE events but never enters history."""
+    async def fake_generate(_settings, history):
+        yield module.ModelChunk("Sorting the options by cost. ", "reasoning")
+        yield module.ModelChunk("Breadth-first search fits best. ", "reasoning")
+        yield "The answer is breadth-first search."
+
+    monkeypatch.setattr(module, "generate_tokens", fake_generate)
+    client.put("/api/settings", json={"provider": "ollama", "model": "qwen3:8b"})
+    thread_id = client.post("/api/threads", json={"course_id": client.get("/api/courses").json()[0]["id"]}).json()["id"]
+    with client.stream("POST", f"/api/threads/{thread_id}/stream", json={"content": "Explain BFS"}) as response:
+        assert response.status_code == 200
+        events = [json.loads(line[6:]) for line in response.iter_lines() if line.startswith("data: ")]
+    assert [event["type"] for event in events] == ["started", "sources", "reasoning", "reasoning", "delta", "done"]
+    assert events[2]["content"].startswith("Sorting the options")
+    assert events[4]["content"] == "The answer is breadth-first search."
+    messages = client.get(f"/api/threads/{thread_id}/messages").json()
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == "The answer is breadth-first search."

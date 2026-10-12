@@ -16,8 +16,8 @@ EXAM_TYPES = ('quiz', 'midterm', 'final', 'assignment', 'practice', 'custom')
 DIFFICULTIES = ('hard++', 'complex', 'moderate', 'easy')
 FORMATS = ('mcq', 'short_answer', 'long_answer', 'problem_solving', 'custom')
 SCOPE = ('all_course', 'selected', 'general')
-STEPS = ('faculty_initials', 'university_name', 'exam_type', 'total_marks',
-         'difficulty', 'question_formats', 'material_scope')
+# Complexity, university, initials are optional; ask for them only if they matter.
+STEPS = ('exam_type', 'total_marks', 'question_formats', 'material_scope')
 
 
 class QuestionFormat(BaseModel):
@@ -48,6 +48,7 @@ class RequirementsPatch(BaseModel):
     difficulty: str | None = None
     question_formats: list[QuestionFormat] | None = Field(default=None, max_length=12)
     material_scope: str | None = None
+    topic_scope: str | None = Field(default=None, min_length=2, max_length=200)
 
     @field_validator('total_marks')
     @classmethod
@@ -77,7 +78,7 @@ class RequirementsPatch(BaseModel):
             raise ValueError('Unsupported material scope')
         return value
 
-    @field_validator('faculty_initials', 'university_name')
+    @field_validator('faculty_initials', 'university_name', 'topic_scope')
     @classmethod
     def clean_text(cls, value: str | None) -> str | None:
         if value is not None:
@@ -98,7 +99,8 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
             context_summary TEXT NOT NULL DEFAULT '',
             approved_at REAL,
             created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
+            updated_at REAL NOT NULL,
+            next_question TEXT
         );
         CREATE TABLE IF NOT EXISTS exam_tool_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,6 +109,8 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
             created_at REAL NOT NULL
         );
     ''')
+    if 'next_question' not in {r['name'] for r in conn.execute('PRAGMA table_info(exam_sessions)')}:
+        conn.execute('ALTER TABLE exam_sessions ADD COLUMN next_question TEXT')
 
 
 def read(conn: sqlite3.Connection, thread_id: str) -> dict | None:
@@ -173,7 +177,7 @@ def update(conn: sqlite3.Connection, thread_id: str, patch: RequirementsPatch,
     if document_ids is None:
         document_ids = session['document_ids']
     conn.execute('''UPDATE exam_sessions SET requirements=?, document_ids=?, status=?,
-        approved_at=NULL, updated_at=? WHERE thread_id=?''',
+        approved_at=NULL, next_question=NULL,updated_at=? WHERE thread_id=?''',
         (json.dumps(merged), json.dumps(document_ids),
          'awaiting_approval' if not missing(merged, document_ids) else 'collecting',
          time.time(), thread_id))
@@ -212,3 +216,8 @@ def log_tool(conn: sqlite3.Connection, thread_id: str, name: str) -> None:
     # Never persist full model input, extracted secret, or source text to telemetry.
     conn.execute('INSERT INTO exam_tool_events(thread_id,tool_name,created_at) VALUES(?,?,?)',
                  (thread_id, name, time.time()))
+
+
+def set_next_question(conn: sqlite3.Connection, thread_id: str, question: str) -> None:
+    conn.execute('UPDATE exam_sessions SET next_question=? WHERE thread_id=?',
+                 (question[:300],thread_id))
