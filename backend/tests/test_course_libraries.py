@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend import app as service, documents, generation
+from backend.tests.exam_helpers import approve_exam
 
 
 @pytest.fixture
@@ -120,6 +121,7 @@ def test_assessment_persists_selected_course_materials(client, monkeypatch):
     doc_b = new_document(client, b, "b.txt", "Cell structure includes organelles and membranes.")
     tid = new_thread(client, a)
     monkeypatch.setattr(generation, "create_blueprint", lambda *args: (_ for _ in ()).throw(RuntimeError("test run")))
+    approve_exam(client, tid, document_ids=[doc_a])
     response = client.post(f"/api/threads/{tid}/generations", json={
         "prompt": "Prepare a quiz about newtonian mechanics", "document_ids": [doc_a],
     })
@@ -163,6 +165,7 @@ def test_assessment_worker_retrieves_only_chosen_file(client, monkeypatch):
     monkeypatch.setattr(generation, "create_blueprint", fake_blueprint)
     monkeypatch.setattr(generation, "generate_question", fake_generate)
     monkeypatch.setattr(generation, "review_question", fake_review)
+    approve_exam(client, tid, document_ids=[selected], total_marks=5)
     response = client.post(f"/api/threads/{tid}/generations", json={
         "prompt": "Write one exam question about climate zones", "document_ids": [selected],
     })

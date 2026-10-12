@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="app/icon.svg" alt="QuestGen pencil icon" width="88" height="88" />
+</p>
+
 # QuestGen
 
 **A chat-based assessment workspace for professors.**
@@ -5,6 +9,16 @@
 QuestGen lets you organize course materials, discuss them with an AI assistant, draft an assessment, revise individual questions, review and approve the results, and export student or instructor copies.
 
 > **Status:** Active development.
+
+## Chat and Exam Mode
+
+Switch seamlessly between **Chat** and **Exam** modes within the same conversation, with shared history, uploaded materials, persistent sessions, and light/dark themes.
+
+**Chat Mode** supports general AI conversations and document-based discussions.
+
+**Exam Mode** provides an interactive, human-in-the-loop exam generator with step-by-step configuration, customizable question distributions, difficulty levels, chapter selection, and professor approval. Generate questions one at a time with **Accept, Regenerate, Edit, and Skip** options.
+
+A live exam-paper sidebar displays selected questions, marks, and progress, with editing, reordering, and removal controls. All progress is saved automatically, and approved papers can be exported as **PDF or DOCX**.
 
 ## Current features
 
@@ -99,6 +113,34 @@ Environment variables are also supported (set them **before** starting FastAPI):
 | Ollama     | `QUESTGEN_OLLAMA_URL` (default `http://127.0.0.1:11434`); optional `QUESTGEN_OLLAMA_API_KEY` for protected proxies |
 
 Anthropic generation currently uses an OpenAI-compatible API path, while model discovery uses its model-list endpoint. Availability in the picker **does not guarantee** that a model supports tool calling or structured assessment generation. Test the actual generation workflow with your chosen model.
+
+#### Exam configuration API
+
+- `POST /api/threads/{thread_id}/exam/start` — create or resume the examination setup.
+- `GET /api/threads/{thread_id}/exam` — read the current configuration.
+- `POST /api/threads/{thread_id}/exam/turn` — discuss and extract explicit requirements.
+- `PATCH /api/threads/{thread_id}/exam/requirements` — save validated fields and document selection.
+- `POST /api/threads/{thread_id}/exam/approve` — approve complete requirements.
+
+#### Interactive paper API
+
+- `GET /api/threads/{thread_id}/exam/paper` — restore the paper, candidate and accepted questions.
+- `POST /api/threads/{thread_id}/exam/paper/prepare` — prepare a syllabus-aware section blueprint.
+- `PUT /api/threads/{thread_id}/exam/paper/blueprint` — revise title, topic and difficulty without changing approved marks.
+- `POST /api/threads/{thread_id}/exam/paper/approve` — approve the blueprint.
+- `POST /api/threads/{thread_id}/exam/paper/next` — generate and review a candidate for the next unfilled slot.
+- `POST /api/threads/{thread_id}/exam/paper/regenerate` — replace the candidate without saving it to the paper.
+- `PATCH /api/threads/{thread_id}/exam/paper/candidate` — edit a pending candidate.
+- `POST /api/threads/{thread_id}/exam/paper/accept` — accept one candidate into the paper.
+- `POST /api/threads/{thread_id}/exam/paper/skip` — discard one candidate without using marks.
+- `PATCH /api/threads/{thread_id}/exam/paper/questions/{question_id}` — edit a saved question.
+- `DELETE /api/threads/{thread_id}/exam/paper/questions/{question_id}` — remove a question and reopen its slot.
+- `PUT /api/threads/{thread_id}/exam/paper/order` — reorder accepted questions.
+- `GET /api/threads/{thread_id}/exam/paper/questions/{question_id}/versions` — inspect saved edit history.
+
+The existing bulk-generation endpoints remain available for older assessment jobs. The interactive paper has its own final-approval and PDF/DOCX export endpoints (`/api/threads/{thread_id}/exam/paper/final-approve` and `/api/threads/{thread_id}/exam/paper/export/{audience}.{format}`).
+
+Run `PYTHONPATH=. pytest backend/tests -q` from the repository root to execute regression tests.
 
 ## Unified document ingestion, vision, and embeddings
 

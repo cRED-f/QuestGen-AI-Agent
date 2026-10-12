@@ -5,6 +5,8 @@ compared against the original version before commit; locks are always enforced.
 """
 from __future__ import annotations
 
+from backend.marks import display
+
 import io
 import json
 import sqlite3
@@ -437,3 +439,109 @@ def export_assessment(conn: sqlite3.Connection, job_id: str, audience: Literal['
         body = output.getvalue()
         media = 'application/pdf'
     return body, media, f'questgen-{audience}-{job_id[:8]}.{format}'
+
+
+def export_interactive_paper(conn: sqlite3.Connection, thread_id: str,
+                             audience: Literal['student','instructor'],
+                             format: Literal['pdf','docx']) -> tuple[bytes, str, str]:
+    """Export an approved snapshot of the interactive paper, never a draft or candidate.
+
+    Rendering follows the same section/position order shown in the live paper sidebar.
+    This is separate from legacy assessment jobs but uses the existing DOCX/PDF stack.
+    """
+    from backend import exam_builder
+    exam_builder.approved_for_export(conn, thread_id)
+    paper = exam_builder.read(conn, thread_id)
+    session = exam_builder.exam_state.read(conn, thread_id)
+    req = session['requirements']
+    blueprint = paper['blueprint']
+    title = blueprint['title']
+    sections = [(section, [q for q in paper['questions']
+                           if q['content']['section_id'] == section['id']])
+                for section in blueprint['sections']]
+    if sum(len(group) for _, group in sections) != paper['total_questions']:
+        raise HTTPException(409, 'The paper is incomplete')
+    for _, group in sections:
+        for q in group:
+            exam_builder._validate_content(q['content'], q['content'])
+    if format == 'docx':
+        from docx import Document
+        from docx.shared import Inches, Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        doc = Document()
+        doc.sections[0].top_margin = Inches(0.75)
+        doc.sections[0].bottom_margin = Inches(0.75)
+        doc.styles['Normal'].font.size = Pt(10.5)
+        header = doc.add_paragraph(req['university_name'])
+        header.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        header.runs[0].bold = True
+        heading = doc.add_heading(title, level=1)
+        heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        doc.add_paragraph(f"{req['exam_type'].title()} | Faculty: {req['faculty_initials']} | Full marks: {display(paper['total_marks'])}")
+        doc.add_paragraph(blueprint['instructions'])
+        if audience == 'instructor':
+            doc.add_paragraph('INSTRUCTOR COPY - ANSWERS AND EXPLANATIONS')
+        for i, (section, group) in enumerate(sections, 1):
+            doc.add_heading(f"Section {i}: {section['kind'].replace('_', ' ').title()}", level=2)
+            for question in group:
+                c = question['content']
+                para = doc.add_paragraph()
+                para.paragraph_format.keep_with_next = bool(c['options'])
+                para.add_run(f"Q{question['position']}. ").bold = True
+                para.add_run(c['stem'] + f" ({display(c['marks'])} marks)")
+                for j, option in enumerate(c['options']):
+                    doc.add_paragraph(f"{chr(65+j)}. {option}")
+                if audience == 'instructor':
+                    doc.add_paragraph('Answer: ' + c['correct_answer'])
+                    doc.add_paragraph('Explanation: ' + c.get('explanation', ''))
+                    if c.get('marking_guidance'):
+                        doc.add_paragraph('Marking guidance: ' + str(c['marking_guidance']))
+                    for source in c.get('sources', []):
+                        name = str(source.get('filename', 'Uploaded material'))
+                        if source.get('page') is not None:
+                            name += f" - {'slide' if source.get('extension') == '.pptx' else 'page'} {source['page']}"
+                        doc.add_paragraph('Source: ' + name)
+        output = io.BytesIO()
+        doc.save(output)
+        content = output.getvalue()
+        mime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    else:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+        from reportlab.lib.enums import TA_CENTER
+        from xml.sax.saxutils import escape
+        styles = getSampleStyleSheet()
+        styles['Normal'].leading = 15
+        centered = styles['Heading2'].clone('QuestGenCentered')
+        centered.alignment = TA_CENTER
+        output = io.BytesIO()
+        story = [Paragraph(escape(req['university_name']), centered),
+                 Paragraph(escape(title), styles['Title']),
+                 Paragraph(escape(f"{req['exam_type'].title()} | Faculty: {req['faculty_initials']} | Full marks: {display(paper['total_marks'])}"), styles['Normal']),
+                 Spacer(1, 10), Paragraph(escape(blueprint['instructions']), styles['Normal'])]
+        if audience == 'instructor':
+            story.append(Paragraph('INSTRUCTOR COPY - ANSWERS AND EXPLANATIONS', styles['Heading3']))
+        for i, (section, group) in enumerate(sections, 1):
+            story.extend((Spacer(1, 8), Paragraph(escape(f"Section {i}: {section['kind'].replace('_', ' ').title()}"), styles['Heading2'])))
+            for question in group:
+                c = question['content']
+                story.append(Spacer(1, 8))
+                story.append(Paragraph(escape(f"Q{question['position']}. {c['stem']} ({display(c['marks'])} marks)"), styles['Normal']))
+                for j, option in enumerate(c['options']):
+                    story.append(Paragraph(escape(f'{chr(65+j)}. {option}'), styles['Normal']))
+                if audience == 'instructor':
+                    story.append(Paragraph('<b>Answer:</b> ' + escape(c['correct_answer']), styles['Normal']))
+                    story.append(Paragraph('<b>Explanation:</b> ' + escape(c.get('explanation', '')), styles['Normal']))
+                    if c.get('marking_guidance'):
+                        story.append(Paragraph('<b>Marking guidance:</b> ' + escape(str(c['marking_guidance'])), styles['Normal']))
+                    for source in c.get('sources', []):
+                        name = str(source.get('filename', 'Uploaded material'))
+                        if source.get('page') is not None:
+                            name += f" - {'slide' if source.get('extension') == '.pptx' else 'page'} {source['page']}"
+                        story.append(Paragraph('Source: ' + escape(name), styles['Normal']))
+        SimpleDocTemplate(output, pagesize=A4, topMargin=48, bottomMargin=48,
+                          leftMargin=48, rightMargin=48, title=title).build(story)
+        content = output.getvalue()
+        mime = 'application/pdf'
+    return content, mime, f'questgen-paper-{audience}-{thread_id[:8]}.{format}'

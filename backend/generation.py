@@ -1,4 +1,4 @@
-"""Phase 3: durable, bounded assessment generation with a Deep Agents supervisor.
+"""Durable, bounded assessment generation with a Deep Agents supervisor.
 
 Jobs and each accepted question are committed independently. Browser disconnects do not
 cancel work; queued/running jobs are recovered on process restart. One local worker is
@@ -16,9 +16,10 @@ import sqlite3
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator, field_validator
 
 from backend import documents
+from backend.marks import to_cents
 
 MAX_QUESTIONS = 20
 MAX_ATTEMPTS = 3
@@ -26,10 +27,16 @@ MAX_ATTEMPTS = 3
 
 class QuestionPlan(BaseModel):
     topic: str = Field(min_length=2, max_length=160)
-    kind: Literal["mcq", "short_answer", "problem_solving"]
+    kind: Literal["mcq", "short_answer", "long_answer", "problem_solving", "custom"]
     difficulty: Literal["easy", "medium", "hard"]
     bloom_level: Literal["remember", "understand", "apply", "analyze", "evaluate", "create"]
-    marks: int = Field(ge=1, le=30)
+    marks: float = Field(ge=0.01, le=30)
+
+    @field_validator("marks")
+    @classmethod
+    def validate_marks(cls, value: float) -> float:
+        to_cents(value, max_marks=30)
+        return value
 
 
 class AssessmentBlueprint(BaseModel):
@@ -40,7 +47,7 @@ class AssessmentBlueprint(BaseModel):
 
     @model_validator(mode="after")
     def totals_match(self):
-        if sum(q.marks for q in self.questions) != self.total_marks:
+        if sum(to_cents(q.marks, max_marks=30) for q in self.questions) != to_cents(self.total_marks, max_marks=200):
             raise ValueError("Blueprint question marks must sum to total_marks")
         return self
 

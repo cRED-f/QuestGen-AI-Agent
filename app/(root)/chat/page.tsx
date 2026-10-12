@@ -7,6 +7,9 @@ import {
   ArrowUpRight,
   BookOpenText,
   ChevronRight,
+  ArrowDown,
+  ChevronDown,
+  Activity,
   Files,
   Eye,
   EyeOff,
@@ -26,16 +29,22 @@ import {
   MessageSquareText,
   Plus,
   Settings2,
+  Sun,
+  Moon,
   Square,
   Trash2,
   X,
 } from "lucide-react";
-import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import FormattedMessage from "@/components/workspace/FormattedMessage";
 import { writeMessageToClipboard } from "@/lib/clipboard";
 import { DocumentPanel, type CourseMaterial, Source, sourceLink, sourceLocation } from "@/components/workspace/DocumentPanel";
 import QuestionEditor, { type AssessmentQuestion } from "@/components/workspace/QuestionEditor";
 import PencilSelect from "@/components/workspace/PencilSelect";
+import ExamConfiguration, { type ExamSession, type ExamRequirements } from "@/components/workspace/ExamConfiguration";
+import ExamPaperBuilder, { type ExamPaper, type PaperBlueprint, type QuestionEdits } from "@/components/workspace/ExamPaperBuilder";
+import ExamPaperSidebar from "@/components/workspace/ExamPaperSidebar";
 
 type Course = { id: string; name: string; created_at: number };
 type Thread = { id: string; course_id: string; title: string; updated_at: number };
@@ -44,6 +53,7 @@ type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   created_at: number;
+  mode?: "chat" | "exam";
   sources?: Source[];
   documents?: CourseMaterial[];
 };
@@ -98,21 +108,40 @@ type ChatEvent = {
 };
 
 const API = "/api/workspace";
+// This is a per-conversation acknowledgement, never a global onboarding gate.
+const examIntroKey = (id: string) => `questgen:exam-intro:${id}`;
+const introAlreadyConfirmed = (id: string | null) =>
+  Boolean(id && typeof window !== "undefined" && window.localStorage.getItem(examIntroKey(id)) === "true");
 const SUGGESTIONS = [
-  "Design a 40-mark midterm assessment for a data structures course",
-  "Suggest a Bloom's taxonomy distribution for a university exam",
-  "Help me improve the clarity of my multiple-choice questions",
+  "Explain the difference between BFS and DFS with examples",
+  "Help me understand a concept from my uploaded lectures",
+  "Discuss how Bloom's taxonomy can improve learning",
 ];
 
 async function requestJson<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, {
+  const fetchOnce = () => fetch(`${API}${path}`, {
     ...options,
     headers: { "Content-Type": "application/json", ...options?.headers },
     cache: "no-store",
   });
+  let response: Response;
+  try {
+    response = await fetchOnce();
+    // Reload may race a restarting local backend. Retry safe reads once only.
+    if ((options?.method || "GET").toUpperCase() === "GET" && [500, 502, 503, 504].includes(response.status)) {
+      await new Promise(resolve => setTimeout(resolve, 350));
+      response = await fetchOnce();
+    }
+  } catch {
+    throw new Error("Cannot reach QuestGen's local API. Check that the FastAPI backend is running on port 8000, then retry.");
+  }
   if (!response.ok) {
     const result = await response.json().catch(() => ({}));
-    throw new Error(result.detail || `Request failed (${response.status})`);
+    const message = typeof result.detail === "string" ? result.detail : "";
+    const endpoint = path.split("?")[0].replace(/\/threads\/[^/]+/, "/threads/…");
+    throw new Error(message || (response.status >= 500
+      ? `Backend error (${response.status}) while loading ${endpoint}. Check the FastAPI terminal for the traceback.`
+      : `Request failed (${response.status}) at ${endpoint}`));
   }
   return response.status === 204 ? (undefined as T) : ((await response.json()) as T);
 }
@@ -162,6 +191,19 @@ export default function ChatPage() {
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [showScrollDown, setShowScrollDown] = useState(false);
+  const [hitlActionsTarget, setHitlActionsTarget] = useState<HTMLDivElement | null>(null);
+  const [activityExpanded, setActivityExpanded] = useState<Record<string, boolean>>({});
+  const [assistantActivity, setAssistantActivity] = useState<Record<string, {started: number; visibleChars: number; done?: boolean}>>({});
+  const [activityNow, setActivityNow] = useState(() => Date.now());
+
+  const [workspaceMode, setWorkspaceMode] = useState<"chat" | "exam">("chat");
+  const [examIntroConfirmed, setExamIntroConfirmed] = useState(false);
+  const [examSession, setExamSession] = useState<ExamSession | null>(null);
+  const [examBusy, setExamBusy] = useState(false);
+  const [examPaper, setExamPaper] = useState<ExamPaper | null>(null);
+  const [paperBusy, setPaperBusy] = useState(false);
+  const paperAbortRef = useRef<AbortController | null>(null);
   const [assessment, setAssessment] = useState<AssessmentJob | null>(null);
   const [activities, setActivities] = useState<AssessmentActivity[]>([]);
   const [startingExam, setStartingExam] = useState(false);
@@ -174,6 +216,7 @@ export default function ChatPage() {
   const [modelsError, setModelsError] = useState("");
   const [modelRefresh, setModelRefresh] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [theme, setTheme] = useState<"light" | "dark">("light");
   const [connections, setConnections] = useState<ProviderConnection[]>([]);
   const [connectionsLoading, setConnectionsLoading] = useState(false);
   const [providerKey, setProviderKey] = useState("");
@@ -206,10 +249,29 @@ export default function ChatPage() {
   const [error, setError] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLElement | null>(null);
+  const chatFrameRef = useRef<HTMLDivElement | null>(null);
+  const followConversationRef = useRef(true);
+  const scrollAnchorRef = useRef<{ id: string | null; top: number; scrollTop: number } | null>(null);
   const textRef = useRef<HTMLTextAreaElement | null>(null);
   const savedComposerDraftRef = useRef("");
+  const chatDraftRef = useRef("");
+  const examDraftRef = useRef("");
   const savedAttachmentsRef = useRef<CourseMaterial[]>([]);
   const activeCourseRef = useRef("");
+  useEffect(() => {
+    const saved = window.localStorage.getItem("questgen:theme");
+    const initial = saved === "dark" ? "dark" : "light";
+    setTheme(initial);
+    document.documentElement.dataset.theme = initial;
+    document.documentElement.style.colorScheme = initial;
+  }, []);
+  const chooseTheme = (next: "light" | "dark") => {
+    setTheme(next);
+    document.documentElement.dataset.theme = next;
+    document.documentElement.style.colorScheme = next;
+    window.localStorage.setItem("questgen:theme", next);
+  };
+
   const currentCourse = courses.find((course) => course.id === courseId);
   const currentThread = threads.find((thread) => thread.id === threadId);
 
@@ -303,15 +365,24 @@ export default function ChatPage() {
     let active = true;
     activeCourseRef.current = courseId;
     window.localStorage.setItem("questgen:course", courseId);
+    followConversationRef.current = true;
+    setShowScrollDown(false);
+    setWorkspaceMode(window.localStorage.getItem(`questgen:mode:${courseId}`) === "exam" ? "exam" : "chat");
+    setExamIntroConfirmed(false);
     setThreads([]);
     setDocumentsOpen(false);
     setLibraryDocuments([]);
     setAttachedDocuments([]);
     savedAttachmentsRef.current = [];
+    chatDraftRef.current = "";
+    examDraftRef.current = "";
     setThreadId(null);
+    setExamSession(null);
+    setExamIntroConfirmed(false);
+    setExamPaper(null);
     setMessages([]);
     setEditingMessageId(null);
-    setInput((current) => editingMessageId ? savedComposerDraftRef.current : current);
+    setInput("");
     savedComposerDraftRef.current = "";
     setAssessment(null);
     setActivities([]);
@@ -322,6 +393,7 @@ export default function ChatPage() {
       const last = window.localStorage.getItem(`questgen:thread:${courseId}`);
       if (last && available.some((item) => item.id === last)) {
         setThreadId(last);
+        setExamIntroConfirmed(introAlreadyConfirmed(last));
         requestJson<ChatMessage[]>(`/threads/${last}/messages`)
           .then((items) => active && setMessages(items))
           .catch((cause: Error) => active && setError(cause.message));
@@ -337,7 +409,8 @@ export default function ChatPage() {
   }, []);
 
   useEffect(() => {
-    if (!threadId) { setAssessment(null); setActivities([]); return; }
+    // Legacy bulk-generation jobs are not part of the interactive Exam workflow.
+    if (!threadId || workspaceMode === "exam") { setAssessment(null); setActivities([]); return; }
     let active = true;
     requestJson<AssessmentJob[]>(`/threads/${threadId}/generations`).then((jobs) => {
       if (!active) return;
@@ -345,7 +418,7 @@ export default function ChatPage() {
       setActivities(jobs[0]?.events || []);
     }).catch((cause: Error) => { if (active) setError(cause.message); });
     return () => { active = false; };
-  }, [threadId]);
+  }, [threadId, workspaceMode]);
 
   useEffect(() => {
     if (!threadId || !assessment || (assessment.status !== "queued" && assessment.status !== "running")) return;
@@ -371,13 +444,61 @@ export default function ChatPage() {
     return () => source.close();
   }, [threadId, assessment?.id, assessment?.status]);
 
+  // Keep the currently visible message stable when the mode (or composer) changes.
+  // Do not remount the conversation or animate the entire message frame.
+  const captureConversationAnchor = () => {
+    const viewport = scrollRef.current;
+    if (!viewport) return;
+    const firstVisible = Array.from(viewport.querySelectorAll<HTMLElement>("[data-message-id]"))
+      .find(element => element.getBoundingClientRect().bottom > viewport.getBoundingClientRect().top);
+    scrollAnchorRef.current = {
+      id: firstVisible?.dataset.messageId ?? null,
+      top: firstVisible?.getBoundingClientRect().top ?? 0,
+      scrollTop: viewport.scrollTop,
+    };
+  };
+  useLayoutEffect(() => {
+    const saved = scrollAnchorRef.current;
+    const viewport = scrollRef.current;
+    if (!saved || !viewport) return;
+    const anchor = Array.from(viewport.querySelectorAll<HTMLElement>("[data-message-id]"))
+      .find(element => element.dataset.messageId === saved.id);
+    viewport.scrollTop = anchor ? saved.scrollTop + anchor.getBoundingClientRect().top - saved.top : saved.scrollTop;
+    scrollAnchorRef.current = null;
+  }, [workspaceMode, examIntroConfirmed]);
+  const updateScrollStatus = useCallback(() => {
+    const viewport = scrollRef.current;
+    if (!viewport) return;
+    const distance = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+    followConversationRef.current = distance < 95;
+    setShowScrollDown(distance > 145);
+  }, []);
+  const scrollToLatest = useCallback((smooth = true) => {
+    const viewport = scrollRef.current;
+    if (!viewport) return;
+    followConversationRef.current = true;
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+    viewport.scrollTo({top: viewport.scrollHeight, behavior: smooth && !reducedMotion ? "smooth" : "auto"});
+    setShowScrollDown(false);
+  }, []);
+  useLayoutEffect(() => {
+    if (followConversationRef.current && !scrollAnchorRef.current) scrollToLatest(false);
+  }, [messages, busy, scrollToLatest]);
   useEffect(() => {
-    // Only scroll the conversation viewport, never the document or outer workspace.
-    if (messages.length) {
-      const viewport = scrollRef.current;
-      viewport?.scrollTo({ top: viewport.scrollHeight, behavior: busy ? "instant" : "smooth" });
-    }
-  }, [messages, busy]);
+    const frame = chatFrameRef.current;
+    if (!frame || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (followConversationRef.current && !scrollAnchorRef.current) scrollToLatest(false);
+      else updateScrollStatus();
+    });
+    observer.observe(frame);
+    return () => observer.disconnect();
+  }, [workspaceMode, threadId, scrollToLatest, updateScrollStatus]);
+  useEffect(() => {
+    if (!busy) return;
+    const timer = window.setInterval(() => setActivityNow(Date.now()), 600);
+    return () => window.clearInterval(timer);
+  }, [busy]);
 
   // Stay one line when empty, but grow naturally for longer prompts and edits.
   useEffect(() => {
@@ -386,6 +507,10 @@ export default function ChatPage() {
     textarea.style.height = "auto";
     textarea.style.height = `${Math.min(textarea.scrollHeight, Math.min(142, window.innerHeight * 0.25))}px`;
   }, [input]);
+
+  useEffect(() => {
+    if (workspaceMode === "exam" && examIntroConfirmed) textRef.current?.focus();
+  }, [workspaceMode, examIntroConfirmed]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
@@ -400,7 +525,10 @@ export default function ChatPage() {
 
   const beginNewChat = () => {
     if (busy) return;
+    setExamIntroConfirmed(false);
     setThreadId(null);
+    setExamSession(null);
+    setExamPaper(null);
     setMessages([]);
     setEditingMessageId(null);
     setInput((current) => editingMessageId ? savedComposerDraftRef.current : current);
@@ -417,8 +545,13 @@ export default function ChatPage() {
 
   const openThread = async (id: string) => {
     if (busy || id === threadId) return;
+    setExamIntroConfirmed(introAlreadyConfirmed(id));
+    followConversationRef.current = true;
+    setShowScrollDown(false);
     setError("");
     setThreadId(id);
+    setExamSession(null);
+    setExamPaper(null);
     setEditingMessageId(null);
     if (editingMessageId) setInput(savedComposerDraftRef.current);
     savedComposerDraftRef.current = "";
@@ -433,6 +566,224 @@ export default function ChatPage() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load conversation.");
     }
+  };
+
+  // Morph only the composer/confirmation surface. The View Transitions API
+  // interpolates their actual bounds; unsupported browsers update immediately.
+  // No animation runs for users who prefer reduced motion.
+  const morphComposer = (update: () => void) => {
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+    const viewDocument = document as Document & {
+      startViewTransition?: (callback: () => void) => { finished: Promise<void> };
+    };
+    captureConversationAnchor();
+    if (reducedMotion || typeof viewDocument.startViewTransition !== "function") {
+      update();
+      return;
+    }
+    const transition = viewDocument.startViewTransition(() => flushSync(update));
+    void transition.finished.catch(() => {});
+  };
+
+  // The selected mode belongs to the workspace, not a new conversation.
+  const switchMode = async (mode: "chat" | "exam") => {
+    if (busy || examBusy || startingExam || editingMessageId || mode === workspaceMode) return;
+    if (workspaceMode === "chat") chatDraftRef.current = input;
+    else examDraftRef.current = input;
+    const nextConfirmed = mode === "exam" ? introAlreadyConfirmed(threadId) : examIntroConfirmed;
+    const currentHasIntro = workspaceMode === "exam" && !examIntroConfirmed;
+    const nextHasIntro = mode === "exam" && !nextConfirmed;
+    const updateMode = () => {
+      setInput(mode === "exam" ? examDraftRef.current : chatDraftRef.current);
+      setExamIntroConfirmed(nextConfirmed);
+      setWorkspaceMode(mode);
+      setError("");
+    };
+    if (currentHasIntro !== nextHasIntro) {
+      morphComposer(updateMode);
+    } else {
+      // Already onboarded: preserve the live composer and all chat DOM nodes.
+      captureConversationAnchor();
+      flushSync(updateMode);
+    }
+    if (courseId) window.localStorage.setItem(`questgen:mode:${courseId}`, mode);
+    if (mode !== "exam" || !courseId) return;
+    setExamBusy(true);
+    try {
+      let target = threadId;
+      if (!target) {
+        const created = await requestJson<Thread>("/threads", {
+          method: "POST", body: JSON.stringify({ course_id: courseId }),
+        });
+        target = created.id;
+        setThreadId(target);
+        setExamIntroConfirmed(introAlreadyConfirmed(target));
+        setThreads(old => [created, ...old]);
+        window.localStorage.setItem(`questgen:thread:${courseId}`, target);
+      }
+      const session = await requestJson<ExamSession>(`/threads/${target}/exam/start`, { method: "POST" });
+      setExamSession(session);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not open Exam Mode.");
+    } finally { setExamBusy(false); }
+  };
+
+  const refreshExamPaper = useCallback(async (id: string) => {
+    const paper = await requestJson<ExamPaper | null>(`/threads/${id}/exam/paper`);
+    setExamPaper(paper);
+    return paper;
+  }, []);
+
+  useEffect(() => {
+    if (!threadId || workspaceMode !== "exam") { setExamPaper(null); return; }
+    let active = true;
+    requestJson<ExamPaper | null>(`/threads/${threadId}/exam/paper`)
+      .then(paper => { if (active) setExamPaper(paper); })
+      .catch((cause: Error) => { if (active) setError(cause.message); });
+    return () => { active = false; };
+  }, [threadId, workspaceMode]);
+
+  const paperAction = async (path: string, method: string = "POST", body?: unknown) => {
+    if (!threadId || paperBusy || examBusy) return;
+    setPaperBusy(true);
+    setError("");
+    const generating = path === "/next" || path === "/regenerate";
+    const abort = generating ? new AbortController() : null;
+    if (generating) {
+      paperAbortRef.current = abort;
+      setExamPaper(old => old ? {...old, status: "generating"} : old);
+    }
+    try {
+      const paper = await requestJson<ExamPaper>(`/threads/${threadId}/exam/paper${path}`, {
+        method, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(abort ? {signal: abort.signal} : {}),
+      });
+      setExamPaper(paper);
+    } catch (cause) {
+      if (!(abort?.signal.aborted)) setError(cause instanceof Error ? cause.message : "Could not update exam paper.");
+      // A timed-out request may have completed server-side; read the authoritative state.
+      await refreshExamPaper(threadId).catch(() => {});
+    } finally {
+      if (paperAbortRef.current === abort) paperAbortRef.current = null;
+      setPaperBusy(false);
+    }
+  };
+
+  const cancelPaperGeneration = async () => {
+    if (!threadId) return;
+    paperAbortRef.current?.abort();
+    setError("");
+    try {
+      const paper = await requestJson<ExamPaper>(`/threads/${threadId}/exam/paper/cancel`, {method: "POST"});
+      setExamPaper(paper);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not cancel generation.");
+      await refreshExamPaper(threadId).catch(() => {});
+    }
+  };
+
+  const downloadPaper = async (audience: "student" | "instructor", format: "pdf" | "docx") => {
+    if (!threadId || !examPaper?.final_approved) return;
+    setError("");
+    try {
+      const response = await fetch(`${API}/threads/${threadId}/exam/paper/export/${audience}.${format}`, {cache: "no-store"});
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(result.detail || `Download failed (${response.status})`);
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `questgen-paper-${audience}-${threadId.slice(0,8)}.${format}`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not download the paper.");
+      await refreshExamPaper(threadId).catch(() => {});
+    }
+  };
+
+  useEffect(() => {
+    if (!threadId || workspaceMode !== "exam") return;
+    let active = true;
+    requestJson<ExamSession>(`/threads/${threadId}/exam/start`, { method: "POST" })
+      .then(session => { if (active) setExamSession(session); })
+      .catch((cause: Error) => { if (active) setError(cause.message); });
+    return () => { active = false; };
+  }, [threadId, workspaceMode]);
+
+  const reconnectWorkspace = async () => {
+    if (!threadId) { setError(""); return; }
+    setError("");
+    try {
+      const saved = await requestJson<ChatMessage[]>(`/threads/${threadId}/messages`);
+      setMessages(saved);
+      if (workspaceMode === "exam") {
+        const current = await requestJson<ExamSession>(`/threads/${threadId}/exam`);
+        const session = current.status === "not_started"
+          ? await requestJson<ExamSession>(`/threads/${threadId}/exam/start`, {method: "POST"}) : current;
+        setExamSession(session);
+        await refreshExamPaper(threadId);
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not reconnect to the workspace.");
+    }
+  };
+
+  const saveExamRequirements = async (updates: Partial<ExamRequirements>, documentIds?: string[]) => {
+    if (!threadId || examBusy) return;
+    setExamBusy(true);
+    setError("");
+    try {
+      const session = await requestJson<ExamSession>(`/threads/${threadId}/exam/requirements`, {
+        method: "PATCH", body: JSON.stringify({ updates, ...(documentIds ? { document_ids: documentIds } : {}) }),
+      });
+      setExamSession(session);
+      setExamPaper(null);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not save exam details."); }
+    finally { setExamBusy(false); }
+  };
+
+  const submitExamQuickReply = async (updates: Partial<ExamRequirements>, answer: string, documentIds?: string[]) => {
+    if (!threadId || examBusy || busy || !examIntroConfirmed) return false;
+    setExamBusy(true);
+    setError("");
+    try {
+      const result = await requestJson<{user_id: string; message_id: string; reply: string; session: ExamSession}>(
+        `/threads/${threadId}/exam/quick-reply`, {
+          method: "POST",
+          body: JSON.stringify({updates, answer, ...(documentIds ? {document_ids: documentIds} : {})}),
+        });
+      setExamSession(result.session);
+      setExamPaper(null);
+      // The requirement save succeeded. A secondary history/sidebar refresh must
+      // not turn that success into a reported failure or discard the editor state.
+      try {
+        const saved = await requestJson<ChatMessage[]>(`/threads/${threadId}/messages`);
+        setMessages(saved);
+      } catch { /* Messages will be reloaded on the next conversation refresh. */ }
+      void refreshThreads(courseId).catch(() => {});
+      return true;
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not save that exam answer.");
+      return false;
+    } finally {
+      setExamBusy(false);
+    }
+  };
+
+  const approveExam = async () => {
+    if (!threadId || examBusy) return;
+    setExamBusy(true);
+    setError("");
+    try {
+      setExamSession(await requestJson<ExamSession>(`/threads/${threadId}/exam/approve`, { method: "POST" }));
+      await refreshExamPaper(threadId);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not approve configuration."); }
+    finally { setExamBusy(false); }
   };
 
   const deleteThread = async (id: string) => {
@@ -597,9 +948,9 @@ export default function ChatPage() {
     action?: { edit_message_id?: string; regenerate_message_id?: string },
   ) => {
     const content = value.trim();
-    if ((!content && !action?.regenerate_message_id) || !courseId || busy || startingExam ||
+    if ((!content && !action?.regenerate_message_id) || !courseId || busy || examBusy || startingExam ||
         (editingMessageId !== null && action?.edit_message_id !== editingMessageId)) return;
-    if (action && !threadId) return;
+    if (action && (!threadId || workspaceMode === "exam")) return;
     const existingId = threadId;
     setBusy(true);
     setError("");
@@ -610,13 +961,17 @@ export default function ChatPage() {
     abortRef.current = controller;
     let activeId = existingId;
     const timestamp = Date.now();
+    followConversationRef.current = true;
+    setShowScrollDown(false);
     const user: ChatMessage = {
       id: `pending-user-${timestamp}`, role: "user", content, created_at: timestamp / 1000,
-      documents: chosenDocuments,
+      documents: chosenDocuments, mode: workspaceMode,
     };
     const answer: ChatMessage = {
-      id: `pending-answer-${timestamp}`, role: "assistant", content: "", created_at: timestamp / 1000,
+      id: `pending-answer-${timestamp}`, role: "assistant", content: "", created_at: timestamp / 1000, mode: workspaceMode,
     };
+    setAssistantActivity(previous => ({...previous, [answer.id]: {started: timestamp, visibleChars: 0}}));
+    setActivityExpanded(previous => ({...previous, [answer.id]: true}));
     setMessages((previous) => {
       if (action?.edit_message_id) {
         const index = previous.findIndex((item) => item.id === action.edit_message_id);
@@ -641,6 +996,21 @@ export default function ChatPage() {
         setThreads((previous) => [created, ...previous]);
       }
       if (controller.signal.aborted) throw new Error("Response stopped.");
+      if (workspaceMode === "exam") {
+        const result = await requestJson<{user_id: string; message_id: string; reply: string; session: ExamSession; sources: Source[]; paper?: ExamPaper | null}>(
+          `/threads/${activeId}/exam/turn`, {
+            method: "POST", signal: controller.signal,
+            body: JSON.stringify({ content, ...(chosenDocuments.length ? {document_ids: chosenDocuments.map(doc => doc.id)} : {}) }),
+          });
+        setExamSession(result.session);
+        setAssistantActivity(previous => ({...previous,
+          [result.message_id]: {started: timestamp, visibleChars: result.reply.length, done: true}}));
+        setActivityExpanded(previous => ({...previous, [result.message_id]: true}));
+        if ("paper" in result) setExamPaper(result.paper ?? null);
+        else if (result.session.status !== "approved") setExamPaper(null);
+        setMessages(previous => previous.map(item => item.id === user.id ? {...item, id: result.user_id}
+          : item.id === answer.id ? {...item, id: result.message_id, content: result.reply, sources: result.sources} : item));
+      } else {
       const response = await fetch(`${API}/threads/${activeId}/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -667,14 +1037,25 @@ export default function ChatPage() {
             ? { ...item, sources: event.sources || [] } : item));
         }
         if (event.type === "delta") {
+          setAssistantActivity(previous => ({...previous, [answer.id]: {
+            started: timestamp, visibleChars: (previous[answer.id]?.visibleChars || 0) + (event.content || "").length,
+          }}));
           setMessages((previous) => previous.map((item) => item.id === answer.id
             ? { ...item, content: item.content + (event.content || "") } : item));
         }
         if (event.type === "done" && event.message_id) {
+          setAssistantActivity(previous => ({...previous, [event.message_id!]: {
+            started: timestamp, visibleChars: previous[answer.id]?.visibleChars || 0, done: true,
+          }}));
+          setActivityExpanded(previous => ({...previous, [event.message_id!]: previous[answer.id] !== false}));
           setMessages((previous) => previous.map((item) => item.id === answer.id ? { ...item, id: event.message_id! } : item));
         }
       });
+      }
     } catch (cause) {
+      setAssistantActivity(previous => ({...previous, [answer.id]: {
+        started: timestamp, visibleChars: previous[answer.id]?.visibleChars || 0, done: true,
+      }}));
       setError(controller.signal.aborted ? "Response stopped. Incomplete responses are not saved." :
         (cause instanceof Error ? cause.message : "Could not generate a response."));
     } finally {
@@ -844,13 +1225,13 @@ export default function ChatPage() {
   };
 
   return (
-    <div className="qg-app">
+    <div className="qg-app" data-theme={theme}>
       {sidebarOpen && (
         <button type="button" aria-label="Close navigation" className="qg-mobile-scrim" onClick={() => setSidebarOpen(false)} />
       )}
       <aside className={`qg-sidebar ${sidebarOpen ? "qg-sidebar--open" : ""}`} aria-label="Workspace navigation">
         <div className="qg-brand">
-          <div className="qg-brand-mark" aria-hidden="true"><PencilLine size={25} strokeWidth={1.8} /></div>
+          <div className="qg-brand-mark" aria-hidden="true"><img src="/icon.svg" alt="" width={39} height={39}/></div>
           <div className="qg-brand-copy"><strong>QuestGen<span className="qg-brand-period">.</span></strong><span>THE ASSESSMENT STUDIO</span></div>
           <button type="button" aria-label="Close navigation" className="qg-icon-button qg-sidebar-close" onClick={() => setSidebarOpen(false)}><X size={19}/></button>
         </div>
@@ -910,7 +1291,7 @@ export default function ChatPage() {
         <div className="qg-sidebar-foot">
           <button type="button" className="qg-settings-link" onClick={() => void openSettings()}>
             <span className="qg-settings-icon"><Settings2 size={19}/></span>
-            <span className="qg-settings-copy"><strong>Model settings</strong><small>{PROVIDERS.find((item) => item.value === settings.provider)?.label} · {settings.model || "Choose model in chat"}</small></span>
+            <span className="qg-settings-copy"><strong>Model settings</strong></span>
             <ChevronRight size={17} aria-hidden="true"/>
           </button>
           <div className="qg-local-label"><span className="qg-status-dot"/> LOCAL WORKSPACE <span className="qg-local-version">V2.0</span></div>
@@ -924,6 +1305,11 @@ export default function ChatPage() {
             <span className="qg-breadcrumb-root">Workspace</span><ChevronRight size={14} className="qg-breadcrumb-chevron"/>
             <span className="qg-breadcrumb-current">{currentCourse?.name || "Choose a course"}</span>
           </div>
+          <div className="qg-mode-switch" data-mode={workspaceMode} role="group" aria-label="Workspace mode">
+            <span className="qg-mode-switch-indicator" aria-hidden="true"/>
+            <button type="button" aria-pressed={workspaceMode === "chat"} onClick={() => void switchMode("chat")} disabled={busy || examBusy}><MessageSquareText size={15}/> Chat</button>
+            <button type="button" aria-pressed={workspaceMode === "exam"} onClick={() => void switchMode("exam")} disabled={busy || examBusy}><ClipboardList size={15}/> Exam</button>
+          </div>
           <div className="qg-topbar-right">
             <span className="qg-current-label" title={currentThread?.title || "New conversation"}>{currentThread?.title || "Untitled conversation"}</span>
             <button type="button" className="qg-topbar-button" onClick={() => openLibrary("picker")} disabled={!courseId}><Files size={17}/><span>Materials</span></button>
@@ -935,12 +1321,13 @@ export default function ChatPage() {
           </div>
         </header>
 
-        <div className="qg-paper-workspace">
-          <section ref={scrollRef} className={`qg-chat-scroll ${!loading && messages.length === 0 && !assessment ? "qg-chat-scroll--welcome" : ""}`} aria-live="polite" aria-label="Conversation">
-            <div className="qg-chat-frame">
+        <div className={`qg-paper-workspace ${workspaceMode === "exam" && examIntroConfirmed && examSession?.status === "approved" ? "qg-paper-workspace--building" : ""}`}>
+          <div className={`qg-chat-column ${workspaceMode === "exam" ? "qg-chat-column--exam" : ""}`}>
+          <section ref={scrollRef} onScroll={updateScrollStatus} className={`qg-chat-scroll ${!loading && workspaceMode === "chat" && messages.length === 0 && !assessment ? "qg-chat-scroll--welcome" : ""}`} aria-live="polite" aria-label="Conversation">
+            <div className="qg-chat-frame" ref={chatFrameRef}>
               {loading ? (
                 <div className="qg-loading"><Loader2 size={20} className="qg-spin"/><span>Opening your workspace…</span></div>
-              ) : messages.length === 0 ? (
+              ) : messages.length === 0 && workspaceMode === "chat" ? (
                 <div className="qg-welcome">
                   <div className="qg-welcome-issue"><span className="qg-issue-line"/> THE PROFESSOR'S WORKSPACE <span className="qg-issue-line"/></div>
                   <div className="qg-welcome-icon" aria-hidden="true"><PenLine size={27} strokeWidth={1.5}/><span className="qg-icon-spark">✳</span></div>
@@ -960,11 +1347,17 @@ export default function ChatPage() {
                     <ArrowRight size={16}/>
                   </button>
                 </div>
+              ) : messages.length === 0 && workspaceMode === "exam" ? (
+                <div className="qg-exam-empty" aria-label="Exam assistant">
+                  <div className="qg-exam-empty-symbol"><ClipboardList size={24}/></div>
+                  <h1>Your exam, your questions.</h1>
+                  <p>We'll shape the paper together, one decision at a time. Nothing is generated until you approve the details.</p>
+                </div>
               ) : (
                 <div className="qg-messages">
                   <div className="qg-conversation-meta"><span className="qg-meta-rule"/> <span>CONVERSATION NOTES</span> <span className="qg-meta-rule"/></div>
                   {messages.map((message) => (
-                    <article key={message.id} className={`qg-message qg-message--${message.role}`}>
+                    <article key={message.id} data-message-id={message.id} className={`qg-message qg-message--${message.role}`}>
                       {message.role === "assistant" && <div className="qg-assistant-symbol" aria-hidden="true"><PencilLine size={18}/></div>}
                       <div className="qg-message-content">
                         <div className="qg-message-label">{message.role === "assistant" ? "QUESTGEN" : "YOU"}</div>
@@ -976,7 +1369,20 @@ export default function ChatPage() {
                           </>
                         ) : (
                           <div className="qg-assistant-text questgen-prose">
-                            {message.content ? <FormattedMessage content={message.content}/> : <span className="qg-thinking"><Loader2 size={15} className="qg-spin"/> Thinking through your question…</span>}
+                            {message.role === "assistant" && (assistantActivity[message.id] || message.id.startsWith("pending-answer-")) && (() => {
+                              const stats = assistantActivity[message.id];
+                              const isPending = message.id.startsWith("pending-answer-");
+                              const visibleTokens = Math.ceil((stats?.visibleChars ?? message.content.length) / 4);
+                              const elapsed = stats ? (Math.max(0, activityNow - stats.started) / 1000).toFixed(1) : "0.0";
+                              const expanded = activityExpanded[message.id] !== false;
+                              return <div className="qg-ai-activity">
+                                <button type="button" className="qg-ai-activity-toggle" aria-expanded={expanded} onClick={() => setActivityExpanded(old => ({...old, [message.id]: !expanded}))}>
+                                  <Activity size={13}/> {isPending ? "Generating response" : "Response activity"} <span>~{visibleTokens} output tokens</span> {isPending && <span>{elapsed}s</span>} {expanded ? <ChevronDown size={13}/> : <ChevronRight size={13}/>}
+                                </button>
+                                {expanded && <div className="qg-ai-activity-detail">{isPending ? "Searching context and preparing an answer…" : "Response completed."} Token count is an estimate of visible output, not private model reasoning.</div>}
+                              </div>;
+                            })()}
+                            {message.content ? <FormattedMessage content={message.content}/> : <span className="qg-thinking"><Loader2 size={15} className="qg-spin"/> QuestGen is preparing a response…</span>}
                             {!!message.sources?.length && (
                               <div className="qg-citations">
                                 <div className="qg-citations-title"><BookOpenText size={15}/> REFERENCED MATERIAL</div>
@@ -1014,7 +1420,7 @@ export default function ChatPage() {
                                 <span>{copyFeedback?.id === message.id ? (copyFeedback.status === "copied" ? "Copied" : "Copy failed") : "Copy"}</span>
                               </button>
                             )}
-                            {!busy && !startingExam && !editingMessageId && !message.id.startsWith("pending-") && (message.role === "user" ? (
+                            {workspaceMode === "chat" && (message.mode || "chat") === "chat" && !busy && !startingExam && !editingMessageId && !message.id.startsWith("pending-") && (message.role === "user" ? (
                               <button type="button" onClick={() => editChatMessage(message)} title="Edit this message" aria-label="Edit message">
                                 <Pencil size={14}/> <span>Edit</span>
                               </button>
@@ -1031,7 +1437,8 @@ export default function ChatPage() {
                   ))}
                 </div>
               )}
-              {assessment && (
+
+              {workspaceMode === "exam" && examIntroConfirmed && assessment && !examPaper && examSession?.status !== "approved" && (
                 <section className="qg-assessment" aria-label="Assessment draft">
                   <div className="qg-assessment-head">
                     <span className="qg-overline">ASSESSMENT WORKFLOW</span>
@@ -1074,10 +1481,44 @@ export default function ChatPage() {
               )}
             </div>
           </section>
+          {showScrollDown && <button type="button" className="qg-scroll-latest" onClick={() => scrollToLatest(true)} aria-label="Scroll to latest message" title="Jump to latest message"><ArrowDown size={18}/><span>Latest</span></button>}
 
           <div className="qg-compose-region">
             <div className="qg-compose-inner">
-              {error && <div role="alert" className="qg-error"><AlertCircle size={17}/><span>{error}</span><button type="button" aria-label="Dismiss error" onClick={() => setError("")}><X size={17}/></button></div>}
+              {error && <div role="alert" className="qg-error"><AlertCircle size={17}/><span>{error}</span>{/error|cannot reach|request failed|backend/i.test(error) && <button type="button" className="qg-error-retry" onClick={() => void reconnectWorkspace()}><RefreshCw size={14}/> Retry loading</button>}<button type="button" aria-label="Dismiss error" onClick={() => setError("")}><X size={17}/></button></div>}
+              {workspaceMode === "exam" && !examIntroConfirmed ? (
+                <div className="qg-exam-enter" role="region" aria-label="Enter exam mode">
+                  <div className="qg-exam-enter-icon"><img src="/icon.svg" alt="" width={34} height={34}/></div>
+                  <div className="qg-exam-enter-copy"><span className="qg-exam-enter-kicker">QUESTGEN · EXAM STUDIO</span><strong>{examSession?.status === "approved" ? "Pick up where you left off" : "Let's shape your next exam"}</strong><span>We'll work through the details together. You choose what makes the paper.</span></div>
+                  <button type="button" className="qg-exam-enter-confirm" disabled={examBusy || busy || !examSession} onClick={() => morphComposer(() => {
+                    if (threadId) window.localStorage.setItem(examIntroKey(threadId), "true");
+                    setExamIntroConfirmed(true);
+                    setError("");
+                  })}>
+                    {examBusy ? <Loader2 size={15} className="qg-spin"/> : <Check size={16}/>} {examSession?.status === "approved" ? "Open my paper" : "Start with QuestGen"} <ArrowRight size={15}/>
+                  </button>
+                </div>
+              ) : <>
+              {workspaceMode === "exam" && examSession && <ExamConfiguration
+                session={examSession} documents={libraryDocuments} selectedDocuments={attachedDocuments}
+                busy={examBusy || busy} onChoose={submitExamQuickReply}
+                onSave={saveExamRequirements} onApprove={approveExam}
+                onSelectMaterials={() => openLibrary("picker")}
+                controlsTarget={hitlActionsTarget}>
+                {examIntroConfirmed && examSession.status === "approved" && <ExamPaperBuilder
+                  paper={examPaper} requirements={examSession.requirements} busy={paperBusy || examBusy}
+                  onPrepare={() => paperAction("/prepare")}
+                  onChangeBlueprint={(blueprint: PaperBlueprint) => paperAction("/blueprint", "PUT", { blueprint })}
+                  onApproveBlueprint={() => paperAction("/approve")}
+                  onNext={() => paperAction("/next")}
+                  onAccept={() => paperAction("/accept", "POST", { candidate_id: examPaper?.candidate_id })}
+                  onRegenerate={() => paperAction("/regenerate", "POST", { candidate_id: examPaper?.candidate_id })}
+                  onSkip={() => paperAction("/skip", "POST", { candidate_id: examPaper?.candidate_id })}
+                  onEditCandidate={(changes: QuestionEdits) => paperAction("/candidate", "PATCH", { candidate_id: examPaper?.candidate_id, ...changes })}
+                  onCancelGeneration={cancelPaperGeneration}
+                />}
+              </ExamConfiguration>}
+              {workspaceMode === "exam" && <div ref={setHitlActionsTarget} className="qg-hitl-composer-actions" aria-label="Exam choices and question controls"/>}
               <form className={`qg-composer ${editingMessageId ? "qg-composer--editing" : ""}`} onSubmit={onSubmit}>
                 <div className="qg-composer-topline"><span>{editingMessageId ? "EDIT MESSAGE" : "YOUR NEXT THOUGHT"}</span><span className="qg-compose-line"/></div>
                 {editingMessageId && (
@@ -1098,7 +1539,7 @@ export default function ChatPage() {
                 {attachedDocuments.length > 0 && <div className="qg-attached-list" aria-label="Attached course materials">
                   {attachedDocuments.map((doc) => <span key={doc.id} className="qg-attached-chip"><Files size={13}/><span title={doc.filename}>{doc.filename}</span><button type="button" aria-label={`Remove ${doc.filename}`} onClick={() => setAttachedDocuments((old) => old.filter((item) => item.id !== doc.id))}><X size={13}/></button></span>)}
                 </div>}
-                <textarea ref={textRef} rows={1} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || !courseId || !settings.model} aria-label={editingMessageId ? "Edit message in composer" : "Message QuestGen"} placeholder={!settings.model ? "Choose a model in the top bar to begin…" : assessment?.status === "completed" ? "e.g. Make question 2 harder, or lock question 1…" : "Ask a question, refine an idea, or plan an assessment…"}/>
+                <textarea ref={textRef} rows={1} maxLength={12000} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || examBusy || !courseId || (workspaceMode === "chat" && !settings.model)} aria-label={editingMessageId ? "Edit message in composer" : "Message QuestGen"} placeholder={workspaceMode === "exam" ? "Answer the current question, or tell me your exam requirements…" : !settings.model ? "Choose a model in the top bar to begin…" : "Ask a question, learn, or discuss any topic…"}/>
                 <div className="qg-composer-actions">
                   {editingMessageId ? (
                     <span className="qg-edit-help">Enter to save · Shift+Enter for new line · Esc to cancel</span>
@@ -1106,25 +1547,33 @@ export default function ChatPage() {
                     <>
                       <button type="button" onClick={() => openLibrary("picker")} disabled={!courseId} className="qg-attach"><Paperclip size={17}/><span>Attach course material</span></button>
                       <span className="qg-keyboard-tip">↵ to send · shift ↵ for new line</span>
-                      {assessment?.status === "completed" && <button type="button" className="qg-assessment-action" onClick={() => void customizeAssessment()}
+                      {workspaceMode === "exam" && assessment?.status === "completed" && !examPaper && <button type="button" className="qg-assessment-action" onClick={() => void customizeAssessment()}
                         disabled={!input.trim() || busy || startingExam || editingQuestionId !== null} title="Apply conversational edits to question(s) in this assessment">
                         <PencilLine size={15}/> Apply to draft
                       </button>}
-                      <button type="button" className="qg-assessment-action" onClick={() => void startAssessment()} disabled={!input.trim() || !courseId || !settings.model || busy || startingExam || assessment?.status === "running" || assessment?.status === "queued"} title="Generate a structured assessment from these instructions">
-                        {startingExam ? <Loader2 size={15} className="qg-spin"/> : <ClipboardList size={16}/>} Generate exam
-                      </button>
+                      {workspaceMode === "exam" && <span className="qg-exam-gate-hint"><ShieldCheck size={14}/> {examSession?.status === "approved" ? "Configuration approved · review the blueprint to generate questions" : "Professor approval required"}</span>}
                     </>
                   )}
                   {busy ? (
                     <button type="button" onClick={() => abortRef.current?.abort()} className="qg-send" title="Stop response" aria-label="Stop response"><Square size={15} fill="currentColor"/></button>
                   ) : (
-                    <button type="submit" disabled={!input.trim() || !courseId || !settings.model} className="qg-send" aria-label={editingMessageId ? "Save edit and regenerate response" : "Send message"} title={editingMessageId ? "Save edit & regenerate" : "Send message"}>{editingMessageId ? <Check size={20}/> : <ArrowUp size={21}/>}</button>
+                    <button type="submit" disabled={!input.trim() || !courseId || examBusy || (workspaceMode === "chat" && !settings.model)} className="qg-send" aria-label={editingMessageId ? "Save edit and regenerate response" : "Send message"} title={editingMessageId ? "Save edit & regenerate" : "Send message"}>{editingMessageId ? <Check size={20}/> : <ArrowUp size={21}/>}</button>
                   )}
                 </div>
               </form>
-              <div className="qg-compose-footer"><span>QUESTGEN · COURSE-BASED ASSISTANCE</span><span>Review AI-generated content before use</span></div>
+              </>}
+              <div className="qg-compose-footer"><span>{workspaceMode === "exam" ? "EXAM · INTERACTIVE PAPER BUILDER" : "QUESTGEN · GENERAL CHAT"}</span><span>Review AI-generated content before use</span></div>
             </div>
           </div>
+          </div>
+          {workspaceMode === "exam" && examIntroConfirmed && examSession?.status === "approved" && <ExamPaperSidebar
+            paper={examPaper} requirements={examSession.requirements} busy={paperBusy}
+            onEdit={(id, changes) => paperAction(`/questions/${id}`, "PATCH", changes)}
+            onRemove={id => paperAction(`/questions/${id}`, "DELETE")}
+            onReorder={question_ids => paperAction("/order", "PUT", {question_ids})}
+            onFinalApprove={() => paperAction("/final-approve")}
+            onDownload={downloadPaper}
+          />}
         </div>
         {documentsOpen && courseId && <DocumentPanel key={`${courseId}:${documentMode}`} courseId={courseId} courseName={currentCourse?.name || "Course"}
           mode={documentMode} selectedIds={attachedDocuments.map((doc) => doc.id)}
@@ -1172,6 +1621,14 @@ export default function ChatPage() {
           <div role="dialog" aria-modal="true" aria-label={settingsOpen ? "Model settings" : "New course"} className="qg-dialog">
             <div className="qg-dialog-head"><div><span className="qg-overline">{settingsOpen ? "MODEL PREFERENCES" : "YOUR COURSE LIBRARY"}</span><h2>{settingsOpen ? "Choose a provider" : "New course"}</h2></div><button type="button" className="qg-icon-button" aria-label="Close dialog" onClick={() => { setSettingsOpen(false); setCourseOpen(false); }}><X size={19}/></button></div>
             {settingsOpen ? (
+              <div className="qg-settings-sections">
+                <div className="qg-settings-appearance" role="group" aria-label="Appearance">
+                  <div className="qg-settings-appearance-copy"><strong>Appearance</strong><span>Warm paper or muted midnight sage.</span></div>
+                  <div className="qg-theme-options">
+                    <button type="button" aria-pressed={theme === "light"} onClick={() => chooseTheme("light")}><Sun size={15}/> Light</button>
+                    <button type="button" aria-pressed={theme === "dark"} onClick={() => chooseTheme("dark")}><Moon size={15}/> Dark</button>
+                  </div>
+                </div>
               <form onSubmit={saveSettings} className="qg-dialog-form qg-connection-form">
                 <label>AI provider</label>
                 <PencilSelect ariaLabel="AI provider" placement="dialog" value={settingsDraft.provider}
@@ -1222,6 +1679,7 @@ export default function ChatPage() {
                   </button>
                 </div>
               </form>
+              </div>
             ) : (
               <form onSubmit={addCourse} className="qg-dialog-form">
                 <label htmlFor="course-name">Course name</label>

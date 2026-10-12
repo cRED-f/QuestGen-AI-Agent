@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from backend import app as module
 from backend import generation
+from backend.tests.exam_helpers import approve_exam
 
 
 @pytest.fixture
@@ -71,6 +72,7 @@ def test_generation_persists_questions_and_replays_activity(client, monkeypatch)
     state = install_fakes(monkeypatch)
     thread_id = thread(client)
     base = f"/api/threads/{thread_id}/generations"
+    approve_exam(client, thread_id)
     created = client.post(base, json={"prompt": "Prepare two questions on data structures"})
     assert created.status_code == 201
     path = f"{base}/{created.json()['id']}"
@@ -94,6 +96,7 @@ def test_recovery_skips_saved_questions_after_retry(client, monkeypatch):
     state = install_fakes(monkeypatch, fail_second=True)
     thread_id = thread(client)
     base = f"/api/threads/{thread_id}/generations"
+    approve_exam(client, thread_id)
     created = client.post(base, json={"prompt": "Make two data structures questions"}).json()
     path = f"{base}/{created['id']}"
     failed = wait_for(client, path, "failed")

@@ -347,7 +347,7 @@ def requested_presentation_ids(query: str, materials: list[dict]) -> list[str]:
     introduce a different lecture into a whole-deck explanation.
     """
     def chapter_number(value: str) -> str | None:
-        match = re.search(r"\b(?:chapter|ch|lecture|unit|module)\s*[-_. ]*0*(\d+)\b", value, re.I)
+        match = re.search(r"\b(?:chapter|chap|ch|lecture|unit|module)\s*[-_. ]*0*(\d+)\b", value, re.I)
         return str(int(match.group(1))) if match else None
 
     pptx = [m for m in materials if m["extension"] == ".pptx" and m["status"] == "ready"]
@@ -372,14 +372,14 @@ def requested_document_ids(query: str, materials: list[dict]) -> list[str]:
     matched = requested_presentation_ids(query, materials)
     if matched:
         return matched
-    numeric = re.search(r"\b(?:chapter|ch|lecture|unit|module)\s*[-_. ]*0*(\d+)\b", query, re.I)
+    numeric = re.search(r"\b(?:chapter|chap|ch|lecture|unit|module)\s*[-_. ]*0*(\d+)\b", query, re.I)
     normalized = re.sub(r"[^a-z0-9]+", " ", query.lower()).strip()
     results = []
     for item in materials:
         if item["status"] != "ready" or item["id"] in matched:
             continue
         stem = re.sub(r"[^a-z0-9]+", " ", Path(item["filename"]).stem.lower()).strip()
-        number = re.search(r"\b(?:chapter|ch|lecture|unit|module)\s*0*(\d+)\b", stem)
+        number = re.search(r"\b(?:chapter|chap|ch|lecture|unit|module)\s*0*(\d+)\b", stem)
         if ((len(stem) >= 5 and re.search(r"(?<!\w)" + re.escape(stem) + r"(?!\w)", normalized))
                 or numeric and number and int(numeric.group(1)) == int(number.group(1))):
             results.append(item["id"])

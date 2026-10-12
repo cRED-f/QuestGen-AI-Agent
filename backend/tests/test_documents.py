@@ -1,4 +1,4 @@
-"""Phase 2 integration tests: ingestion, citations, isolation, recovery and failure handling."""
+"""Integration tests: ingestion, citations, isolation, recovery and failure handling."""
 import io
 import json
 import time
