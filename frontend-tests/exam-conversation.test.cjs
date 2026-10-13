@@ -16,7 +16,7 @@ test('entering Exam Mode hides composer until professor confirms', () => {
   assert.match(page, /Start with QuestGen/);
   assert.match(page, /examIntroKey\(threadId\)/);
   assert.match(page, /setExamIntroConfirmed\(true\)/);
-  assert.match(page, /: <>\s*\{\(workspaceMode === "exam" \|\| \(workspaceMode === "agent"/);
+  assert.match(page, /: <>\s*\{workspaceMode === "exam" && examSession && <ExamConfiguration/);
   assert.match(page, /&& examSession && <ExamConfiguration/);
   assert.match(page, /<form className=\{`qg-composer/);
 });

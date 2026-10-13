@@ -22,7 +22,6 @@ import {
   Check,
   Loader2,
   ClipboardList,
-  BrainCircuit,
   Copy,
   RotateCcw,
   CheckCircle2,
@@ -46,7 +45,6 @@ import PencilSelect from "@/components/workspace/PencilSelect";
 import ExamConfiguration, { type ExamSession, type ExamRequirements } from "@/components/workspace/ExamConfiguration";
 import ExamPaperBuilder, { type ExamPaper, type PaperBlueprint, type QuestionEdits } from "@/components/workspace/ExamPaperBuilder";
 import ExamPaperSidebar from "@/components/workspace/ExamPaperSidebar";
-import AgentWorkflow, {type AgentWork} from "@/components/workspace/AgentWorkflow";
 
 type Course = { id: string; name: string; created_at: number };
 type Thread = { id: string; course_id: string; title: string; updated_at: number };
@@ -55,7 +53,7 @@ type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   created_at: number;
-  mode?: "chat" | "exam" | "agent";
+  mode?: "chat" | "exam";
   sources?: Source[];
   documents?: CourseMaterial[];
 };
@@ -108,33 +106,6 @@ type ChatEvent = {
   content?: string;
   message?: string;
 };
-
-type AgentStatus = {
-  status: "ready" | "running" | "awaiting_user";
-  pending_question: { question: string; context: string; topic_ids?: string[]; options?: string[] } | null;
-  activity: { tool: string; detail: string }[];
-  document_ids: string[];
-};
-type AcademicTopic = {
-  id: string; title: string; description: string;
-  subtopics: string[]; learning_objectives: string[]; assessment_opportunities: string[];
-  cognitive_demand: { levels: string[]; rationale: string };
-  evidence: { chunk_id: string; document_id: string; filename: string; page: number | null; section: string | null }[];
-};
-type AcademicAnalysis = {
-  topics: AcademicTopic[];
-  relationships: { from: string; to: string; kind: string; rationale: string }[];
-  coverage: { analyzed_chunks: number; indexed_chunks: number; complete: boolean;
-    documents: { document_id: string; filename: string; analyzed_chunks: number; indexed_chunks: number }[] };
-  decisions: { question: string; answer: string; topic_ids: string[] }[];
-};
-
-type ResearchMode = "course_only" | "supplement" | "expand";
-type ResearchPolicy = { mode: ResearchMode; expansion_approved: boolean; provider: string; available: boolean };
-type ResearchSource = { id: number; url: string; title: string; domain: string; source_type: string; excerpt: string; retrieved_at: number };
-const DEFAULT_RESEARCH_POLICY: ResearchPolicy = { mode: "supplement", expansion_approved: false, provider: "", available: false };
-
-const INITIAL_AGENT: AgentStatus = { status: "ready", pending_question: null, activity: [], document_ids: [] };
 
 type ExamGenerationStatus = {
   request_id?: string;
@@ -236,14 +207,7 @@ export default function ChatPage() {
   const [assistantReasoning, setAssistantReasoning] = useState<Record<string, string>>({});
   const [activityNow, setActivityNow] = useState(() => Date.now());
 
-  const [workspaceMode, setWorkspaceMode] = useState<"chat" | "exam" | "agent">("chat");
-  const [agentStatus, setAgentStatus] = useState<AgentStatus>(INITIAL_AGENT);
-  const [academicAnalysis, setAcademicAnalysis] = useState<AcademicAnalysis | null>(null);
-  const [researchPolicy, setResearchPolicy] = useState<ResearchPolicy>(DEFAULT_RESEARCH_POLICY);
-  const [researchSources, setResearchSources] = useState<ResearchSource[]>([]);
-  const [agentWorkflow, setAgentWorkflow] = useState<AgentWork | null>(null);
-  const [workflowBusy, setWorkflowBusy] = useState(false);
-  const [researchPolicyBusy, setResearchPolicyBusy] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<"chat" | "exam">("chat");
   const [examIntroConfirmed, setExamIntroConfirmed] = useState(false);
   const [examSession, setExamSession] = useState<ExamSession | null>(null);
   const [examBusy, setExamBusy] = useState(false);
@@ -304,7 +268,6 @@ export default function ChatPage() {
   const savedComposerDraftRef = useRef("");
   const chatDraftRef = useRef("");
   const examDraftRef = useRef("");
-  const agentDraftRef = useRef("");
   const savedAttachmentsRef = useRef<CourseMaterial[]>([]);
   const activeCourseRef = useRef("");
   useEffect(() => {
@@ -324,10 +287,10 @@ export default function ChatPage() {
   // A flagged draft turns the existing composer into a targeted revision input.
   // Its text is independent from the regular chat draft, so selection never
   // discards anything the professor was already typing.
-  const revisionTargets = (workspaceMode === "agent" || (workspaceMode === "exam" && examIntroConfirmed)) && examSession?.status === "approved"
+  const revisionTargets = workspaceMode === "exam" && examIntroConfirmed && examSession?.status === "approved"
     && examPaper && examPaper.status !== "complete" && !examPaper.candidate
     ? examPaper.drafts.filter(draft => draft.decision === "revise") : [];
-  const revisingSelection = revisionTargets.length > 0 && !editingMessageId && (workspaceMode === "exam" || workspaceMode === "agent");
+  const revisingSelection = revisionTargets.length > 0 && !editingMessageId && workspaceMode === "exam";
   const composerText = revisingSelection ? revisionInput : input;
   useEffect(() => { setRevisionInput(""); }, [threadId]);
   const revisionSelectionKey = revisionTargets.map(draft => draft.id).join(":");
@@ -433,7 +396,7 @@ export default function ChatPage() {
     setShowScrollDown(false);
     setWorkspaceMode((() => {
       const saved = window.localStorage.getItem(`questgen:mode:${courseId}`);
-      return saved === "exam" || saved === "agent" ? saved : "chat";
+      return saved === "exam" ? "exam" : "chat";
     })());
     setExamIntroConfirmed(false);
     setThreads([]);
@@ -443,12 +406,6 @@ export default function ChatPage() {
     savedAttachmentsRef.current = [];
     chatDraftRef.current = "";
     examDraftRef.current = "";
-    agentDraftRef.current = "";
-    setAgentStatus(INITIAL_AGENT);
-    setAgentWorkflow(null);
-    setAcademicAnalysis(null);
-    setResearchSources([]);
-    setResearchPolicy(DEFAULT_RESEARCH_POLICY);
     setThreadId(null);
     setExamSession(null);
     setExamIntroConfirmed(false);
@@ -600,11 +557,6 @@ export default function ChatPage() {
     if (busy) return;
     setExamIntroConfirmed(false);
     setThreadId(null);
-    setAgentStatus(INITIAL_AGENT);
-    setAgentWorkflow(null);
-    setAcademicAnalysis(null);
-    setResearchSources([]);
-    setResearchPolicy(DEFAULT_RESEARCH_POLICY);
     setExamSession(null);
     setExamPaper(null);
     setMessages([]);
@@ -628,11 +580,6 @@ export default function ChatPage() {
     setShowScrollDown(false);
     setError("");
     setThreadId(id);
-    setAgentStatus(INITIAL_AGENT);
-    setAgentWorkflow(null);
-    setAcademicAnalysis(null);
-    setResearchSources([]);
-    setResearchPolicy(DEFAULT_RESEARCH_POLICY);
     setExamSession(null);
     setExamPaper(null);
     setEditingMessageId(null);
@@ -669,16 +616,15 @@ export default function ChatPage() {
   };
 
   // The selected mode belongs to the workspace, not a new conversation.
-  const switchMode = async (mode: "chat" | "exam" | "agent") => {
-    if (busy || examBusy || paperBusy || workflowBusy || startingExam || editingMessageId || mode === workspaceMode) return;
+  const switchMode = async (mode: "chat" | "exam") => {
+    if (busy || examBusy || paperBusy || startingExam || editingMessageId || mode === workspaceMode) return;
     if (workspaceMode === "chat") chatDraftRef.current = input;
-    else if (workspaceMode === "exam") examDraftRef.current = input;
-    else agentDraftRef.current = input;
+    else examDraftRef.current = input;
     const nextConfirmed = mode === "exam" ? introAlreadyConfirmed(threadId) : examIntroConfirmed;
     const currentHasIntro = workspaceMode === "exam" && !examIntroConfirmed;
     const nextHasIntro = mode === "exam" && !nextConfirmed;
     const updateMode = () => {
-      setInput(mode === "exam" ? examDraftRef.current : mode === "agent" ? agentDraftRef.current : chatDraftRef.current);
+      setInput(mode === "exam" ? examDraftRef.current : chatDraftRef.current);
       setExamIntroConfirmed(nextConfirmed);
       setWorkspaceMode(mode);
       setError("");
@@ -712,57 +658,6 @@ export default function ChatPage() {
     } finally { setExamBusy(false); }
   };
 
-  useEffect(() => {
-    if (!threadId || workspaceMode !== "agent") return;
-    let active = true;
-    void Promise.all([
-      requestJson<AgentStatus>(`/threads/${threadId}/agent/status`),
-      requestJson<AcademicAnalysis>(`/threads/${threadId}/agent/analysis`),
-      requestJson<ResearchPolicy>(`/threads/${threadId}/agent/research-policy`),
-      requestJson<ResearchSource[]>(`/threads/${threadId}/agent/research-sources`),
-      requestJson<AgentWork | null>(`/threads/${threadId}/agent/workflow`),
-      requestJson<ExamPaper | null>(`/threads/${threadId}/exam/paper`),
-      requestJson<ExamSession>(`/threads/${threadId}/exam`),
-    ]).then(([state, analysis, policy, sources, workflow, paper, session]) => {
-      if (active) { setAgentStatus(state); setAcademicAnalysis(analysis); setResearchPolicy(policy); setResearchSources(sources); setAgentWorkflow(workflow); setExamPaper(paper); setExamSession(session); if (workflow?.status === "approved" && (workflow.kind === "exam" || workflow.kind === "question_bank")) setExamIntroConfirmed(true); }
-    }).catch((cause: Error) => { if (active) setError(cause.message); });
-    return () => { active = false; };
-  }, [threadId, workspaceMode]);
-
-  const changeResearchMode = async (mode: ResearchMode) => {
-    if (!courseId || researchPolicyBusy || busy) return;
-    const approved = mode === "expand" ? window.confirm(
-      "Allow externally researched concepts outside the selected syllabus? You must review and approve any final assessment content separately."
-    ) : false;
-    if (mode === "expand" && !approved) return;
-    setResearchPolicyBusy(true);
-    try {
-      // Save the professor's choice before their first agent turn, too.
-      let target = threadId;
-      let created: Thread | null = null;
-      if (!target) {
-        created = await requestJson<Thread>("/threads", {
-          method: "POST", body: JSON.stringify({ course_id: courseId }),
-        });
-        target = created.id;
-      }
-      const saved = await requestJson<ResearchPolicy>(`/threads/${target}/agent/research-policy`, {
-        method: "PUT", body: JSON.stringify({ mode, expansion_approved: approved }),
-      });
-      if (created) {
-        setThreads((old) => [created, ...old]);
-        setThreadId(created.id);
-        window.localStorage.setItem(`questgen:thread:${courseId}`, created.id);
-      }
-      setResearchPolicy(saved);
-      setError("");
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not update research scope.");
-    } finally {
-      setResearchPolicyBusy(false);
-    }
-  };
-
   const refreshExamPaper = useCallback(async (id: string) => {
     const paper = await requestJson<ExamPaper | null>(`/threads/${id}/exam/paper`);
     setExamPaper(paper);
@@ -770,7 +665,7 @@ export default function ChatPage() {
   }, []);
 
   useEffect(() => {
-    if (!threadId || (workspaceMode !== "exam" && workspaceMode !== "agent")) { setExamPaper(null); return; }
+    if (!threadId || workspaceMode !== "exam") { setExamPaper(null); return; }
     let active = true;
     requestJson<ExamPaper | null>(`/threads/${threadId}/exam/paper`)
       .then(paper => { if (active) setExamPaper(paper); })
@@ -781,7 +676,7 @@ export default function ChatPage() {
   // If the page reloads during a slow generation, reconnect to its durable
   // status instead of leaving the panel indefinitely in "generating".
   useEffect(() => {
-    if (!threadId || (workspaceMode !== "exam" && workspaceMode !== "agent") || examPaper?.status !== "generating" || paperBusy) return;
+    if (!threadId || workspaceMode !== "exam" || examPaper?.status !== "generating" || paperBusy) return;
     let active = true;
     const poll = async () => {
       try {
@@ -800,22 +695,6 @@ export default function ChatPage() {
     const timer = setInterval(() => { void poll(); }, 1500);
     return () => { active = false; clearInterval(timer); };
   }, [threadId, workspaceMode, examPaper?.status, paperBusy, refreshExamPaper]);
-
-  const decideAgentWorkflow = async (approve: boolean) => {
-    if (!threadId || !agentWorkflow || workflowBusy || busy) return;
-    setWorkflowBusy(true);
-    setError("");
-    try {
-      const result = await requestJson<{workflow: AgentWork; paper: ExamPaper | null; exam_session: ExamSession | null}>(
-        `/threads/${threadId}/agent/workflow/${agentWorkflow.id}/decision`, {
-          method: "POST", body: JSON.stringify({approve}),
-        });
-      setAgentWorkflow(result.workflow);
-      if (result.exam_session) { setExamSession(result.exam_session); setExamIntroConfirmed(true); }
-      if (result.paper) setExamPaper(result.paper);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not save your decision."); }
-    finally { setWorkflowBusy(false); }
-  };
 
   const paperAction = async (path: string, method: string = "POST", body?: unknown, onSuccess?: () => void) => {
     if (!threadId || paperBusy || examBusy) return;
@@ -1228,26 +1107,6 @@ export default function ChatPage() {
         else if (result.session.status !== "approved") setExamPaper(null);
         setMessages(previous => previous.map(item => item.id === user.id ? {...item, id: result.user_id}
           : item.id === answer.id ? {...item, id: result.message_id, content: result.reply, sources: result.sources} : item));
-      } else if (workspaceMode === "agent") {
-        const result = await requestJson<{
-          user_id: string; message_id: string; reply: string; sources: Source[]; state: AgentStatus; analysis: AcademicAnalysis;
-          research_policy: ResearchPolicy; research_sources: ResearchSource[]; workflow: AgentWork | null;
-        }>(`/threads/${activeId}/agent/turn`, {
-          method: "POST", signal: controller.signal,
-          body: JSON.stringify({
-            content,
-            ...(chosenDocuments.length ? {document_ids: chosenDocuments.map(doc => doc.id)} : {}),
-          }),
-        });
-        setAgentStatus(result.state);
-        setAcademicAnalysis(result.analysis);
-        setResearchPolicy(result.research_policy);
-        setResearchSources(result.research_sources);
-        setAgentWorkflow(result.workflow);
-        setAssistantActivity(previous => ({...previous,
-          [result.message_id]: {started: timestamp, visibleChars: result.reply.length, done: true}}));
-        setMessages(previous => previous.map(item => item.id === user.id ? {...item, id: result.user_id}
-          : item.id === answer.id ? {...item, id: result.message_id, content: result.reply} : item));
       } else {
       const response = await fetch(`${API}/threads/${activeId}/stream`, {
         method: "POST",
@@ -1297,11 +1156,6 @@ export default function ChatPage() {
       });
       }
     } catch (cause) {
-      // The backend does not persist a failed Agent Mode message. Restore the
-      // draft so a provider fix/retry does not make the professor retype it.
-      if (workspaceMode === "agent" && !action && !controller.signal.aborted) {
-        setInput(previous => previous.trim() ? previous : content);
-      }
       setAssistantActivity(previous => ({...previous, [answer.id]: {
         started: timestamp, visibleChars: previous[answer.id]?.visibleChars || 0, done: true,
       }}));
@@ -1567,7 +1421,6 @@ export default function ChatPage() {
             <span className="qg-mode-switch-indicator" aria-hidden="true"/>
             <button type="button" aria-pressed={workspaceMode === "chat"} onClick={() => void switchMode("chat")} disabled={busy || examBusy}><MessageSquareText size={15}/> Chat</button>
             <button type="button" aria-pressed={workspaceMode === "exam"} onClick={() => void switchMode("exam")} disabled={busy || examBusy}><ClipboardList size={15}/> Exam</button>
-            <button type="button" aria-pressed={workspaceMode === "agent"} onClick={() => void switchMode("agent")} disabled={busy || examBusy}><BrainCircuit size={15}/> Agent</button>
           </div>
           <div className="qg-topbar-right">
             <span className="qg-current-label" title={currentThread?.title || "New conversation"}>{currentThread?.title || "Untitled conversation"}</span>
@@ -1580,7 +1433,7 @@ export default function ChatPage() {
           </div>
         </header>
 
-        <div className={`qg-paper-workspace ${(workspaceMode === "agent" && agentWorkflow?.status === "approved" && (agentWorkflow.kind === "exam" || agentWorkflow.kind === "question_bank") || workspaceMode === "exam" && examIntroConfirmed) && examSession?.status === "approved" ? "qg-paper-workspace--building" : ""}`}>
+        <div className={`qg-paper-workspace ${workspaceMode === "exam" && examIntroConfirmed && examSession?.status === "approved" ? "qg-paper-workspace--building" : ""}`}>
           <div className={`qg-chat-column ${workspaceMode === "exam" ? "qg-chat-column--exam" : ""}`}>
           <section ref={scrollRef} onScroll={updateScrollStatus} className={`qg-chat-scroll ${!loading && workspaceMode === "chat" && messages.length === 0 && !assessment ? "qg-chat-scroll--welcome" : ""}`} aria-live="polite" aria-label="Conversation">
             <div className="qg-chat-frame" ref={chatFrameRef}>
@@ -1605,13 +1458,6 @@ export default function ChatPage() {
                     <span><strong>Working from your own lectures?</strong> Add course materials for grounded answers.</span>
                     <ArrowRight size={16}/>
                   </button>
-                </div>
-              ) : messages.length === 0 && workspaceMode === "agent" ? (
-                <div className="qg-exam-empty qg-agent-welcome" aria-label="Academic agent">
-                  <div className="qg-exam-empty-symbol"><BrainCircuit size={25}/></div>
-                  <h1>Explore before you decide.</h1>
-                  <p>Explore lecture topics, investigate concepts and plan meaningful academic work. The agent can inspect your selected materials and ask you a question when your judgment is needed.</p>
-                  <p className="qg-agent-scope-note">Explore source-backed course topics, academic web research and contextual consultation.</p>
                 </div>
               ) : messages.length === 0 && workspaceMode === "exam" ? (
                 <div className="qg-exam-empty" aria-label="Exam assistant">
@@ -1757,74 +1603,6 @@ export default function ChatPage() {
           <div className="qg-compose-region">
             <div className="qg-compose-inner">
               {error && <div role="alert" className="qg-error"><AlertCircle size={17}/><span>{error}</span>{/error|cannot reach|request failed|backend/i.test(error) && <button type="button" className="qg-error-retry" onClick={() => void reconnectWorkspace()}><RefreshCw size={14}/> Retry loading</button>}<button type="button" aria-label="Dismiss error" onClick={() => setError("")}><X size={17}/></button></div>}
-              {workspaceMode === "agent" && <div className="qg-agent-context" role="status" aria-live="polite">
-                <div className="qg-agent-context-head"><BrainCircuit size={17}/><strong>Academic agent</strong>
-                  <span>{agentStatus.status === "awaiting_user" ? "Waiting for your answer" : busy ? "Investigating" : "Ready to explore"}</span>
-                </div>
-                <div className="qg-agent-research-control" aria-label="Research scope">
-                  <label htmlFor="qg-research-policy">Research sources</label>
-                  <select id="qg-research-policy" value={researchPolicy.mode}
-                    disabled={busy || researchPolicyBusy || !courseId}
-                    onChange={(event) => void changeResearchMode(event.target.value as ResearchMode)}>
-                    <option value="course_only">Course materials only</option>
-                    <option value="supplement">Web research within syllabus</option>
-                    <option value="expand">Include approved external topics</option>
-                  </select>
-                  <small>{researchPolicy.mode === "course_only" ? "Internet access is disabled." :
-                    researchPolicy.available ? `Free DuckDuckGo search is enabled (no API key). Connectivity is checked when searching. External findings are not course evidence.` :
-                    "Web research is unavailable. Install the backend dependencies (including ddgs); course analysis still works."}</small>
-                </div>
-                {agentStatus.pending_question ? (
-                  <div className="qg-agent-pending">
-                    <strong>{agentStatus.pending_question.question}</strong>
-                    {agentStatus.pending_question.context && <p>{agentStatus.pending_question.context}</p>}
-                    {!!agentStatus.pending_question.options?.length && (
-                      <div className="qg-agent-options" aria-label="Suggested responses">
-                        {agentStatus.pending_question.options.map((option) => (
-                          <button key={option} type="button" disabled={busy} onClick={() => setInput(option)}>{option}</button>
-                        ))}
-                      </div>
-                    )}
-                    <small>Reply in the message box to resume this investigation. You can write your own answer.</small>
-                  </div>
-                ) : <p>Agent tools inspect the selected course materials. Ask it to explore a topic, identify relationships or design a research plan.</p>}
-                {academicAnalysis && academicAnalysis.coverage.indexed_chunks > 0 && (
-                  <section className="qg-agent-topic-map" aria-label="Academic topic map">
-                    <div className="qg-agent-topic-head">
-                      <strong>Evidence-backed topic map</strong>
-                      <span>{academicAnalysis.coverage.analyzed_chunks}/{academicAnalysis.coverage.indexed_chunks} passages analyzed
-                        {academicAnalysis.coverage.complete ? " · indexed coverage complete" : " · analysis in progress"}</span>
-                    </div>
-                    {!!academicAnalysis.topics.length && <div className="qg-agent-topic-list">
-                      {academicAnalysis.topics.slice(0, 8).map((topic) => (
-                        <div key={topic.id} className="qg-agent-topic" title={topic.description}>
-                          <strong>{topic.title}</strong>
-                          <span>{topic.evidence.slice(0, 2).map((source) => `${source.filename}${source.page != null ? ` · p. ${source.page}` : ""}`).join("; ")}</span>
-                        </div>
-                      ))}
-                      {academicAnalysis.topics.length > 8 && <span className="qg-agent-topic-more">+{academicAnalysis.topics.length - 8} more topics</span>}
-                    </div>}
-                    {academicAnalysis.relationships.length > 0 && <small>{academicAnalysis.relationships.length} supported topic connections</small>}
-                    {academicAnalysis.decisions.length > 0 && <small>{academicAnalysis.decisions.length} professor decisions incorporated</small>}
-                  </section>
-                )}
-                {researchSources.length > 0 && <section className="qg-agent-sources" aria-label="Academic research sources">
-                  <strong>Web research · {researchSources.length} saved sources</strong>
-                  <div className="qg-agent-sources-list">{researchSources.slice(0, 6).map((source) => (
-                    <a key={source.id} href={source.url} target="_blank" rel="noopener noreferrer" title={source.excerpt}>
-                      <span>{source.title}</span><small>{source.domain} · {source.source_type.replaceAll("_", " ")} · {new Date(source.retrieved_at * 1000).toLocaleDateString()}</small>
-                    </a>
-                  ))}</div>
-                </section>}
-                {agentStatus.activity.length > 0 && <div className="qg-agent-tool-list" aria-label="Recently used tools">
-                  {agentStatus.activity.slice(-4).map((item, index) => <span key={`${item.tool}-${index}`}><Check size={12}/>{item.tool.replaceAll("_", " ")}</span>)}
-                </div>}
-              </div>}
-              {workspaceMode === "agent" && agentWorkflow && <AgentWorkflow
-                workflow={agentWorkflow} topics={academicAnalysis?.topics || []} sources={researchSources}
-                busy={workflowBusy || busy || paperBusy} onDecision={decideAgentWorkflow}
-                onRevise={() => { setInput("Please revise the proposed plan: "); textRef.current?.focus(); }}/>
-              }
               {workspaceMode === "exam" && !examIntroConfirmed ? (
                 <div className="qg-exam-enter" role="region" aria-label="Enter exam mode">
                   <div className="qg-exam-enter-icon"><img src="/icon.svg" alt="" width={34} height={34}/></div>
@@ -1838,7 +1616,7 @@ export default function ChatPage() {
                   </button>
                 </div>
               ) : <>
-              {(workspaceMode === "exam" || (workspaceMode === "agent" && agentWorkflow?.status === "approved" && (agentWorkflow.kind === "exam" || agentWorkflow.kind === "question_bank"))) && examSession && <ExamConfiguration
+              {workspaceMode === "exam" && examSession && <ExamConfiguration
                 session={examSession} documents={libraryDocuments} selectedDocuments={attachedDocuments}
                 busy={examBusy || busy} onChoose={submitExamQuickReply}
                 onSave={saveExamRequirements} onApprove={approveExam}
@@ -1865,7 +1643,7 @@ export default function ChatPage() {
                   onCancelGeneration={cancelPaperGeneration}
                 />}
               </ExamConfiguration>}
-              {(workspaceMode === "exam" || (workspaceMode === "agent" && agentWorkflow?.status === "approved" && (agentWorkflow.kind === "exam" || agentWorkflow.kind === "question_bank"))) && <div ref={setHitlActionsTarget} className="qg-hitl-composer-actions" aria-label="Exam choices and question controls"/>}
+              {workspaceMode === "exam" && <div ref={setHitlActionsTarget} className="qg-hitl-composer-actions" aria-label="Exam choices and question controls"/>}
               <form className={`qg-composer ${editingMessageId ? "qg-composer--editing" : ""} ${revisingSelection ? "qg-composer--revision" : ""}`} onSubmit={onSubmit}>
                 <div className="qg-composer-topline"><span>{editingMessageId ? "EDIT MESSAGE" : "YOUR NEXT THOUGHT"}</span><span className="qg-compose-line"/></div>
                 {editingMessageId && (
@@ -1895,7 +1673,7 @@ export default function ChatPage() {
                 {attachedDocuments.length > 0 && <div className="qg-attached-list" aria-label="Attached course materials">
                   {attachedDocuments.map((doc) => <span key={doc.id} className="qg-attached-chip"><Files size={13}/><span title={doc.filename}>{doc.filename}</span><button type="button" aria-label={`Remove ${doc.filename}`} onClick={() => setAttachedDocuments((old) => old.filter((item) => item.id !== doc.id))}><X size={13}/></button></span>)}
                 </div>}
-                <textarea ref={textRef} rows={1} maxLength={revisingSelection ? 1200 : 12000} value={composerText} onChange={(event) => revisingSelection ? setRevisionInput(event.target.value) : setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || examBusy || (revisingSelection && paperBusy) || !courseId || (workspaceMode !== "exam" && !settings.model)} aria-label={editingMessageId ? "Edit message in composer" : revisingSelection ? "Instructions for selected questions" : "Message QuestGen"} placeholder={revisingSelection ? "Describe what to change — e.g. make Q3 more analytical, use a different example… (optional)" : workspaceMode === "exam" ? "Answer the current question, or tell me your exam requirements…" : workspaceMode === "agent" ? (agentStatus.pending_question ? "Answer the agent’s question to continue…" : "Ask the agent to investigate your course or analyze a topic…") : !settings.model ? "Choose a model in the top bar to begin…" : "Ask a question, learn, or discuss any topic…"}/>
+                <textarea ref={textRef} rows={1} maxLength={revisingSelection ? 1200 : 12000} value={composerText} onChange={(event) => revisingSelection ? setRevisionInput(event.target.value) : setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || examBusy || (revisingSelection && paperBusy) || !courseId || (workspaceMode !== "exam" && !settings.model)} aria-label={editingMessageId ? "Edit message in composer" : revisingSelection ? "Instructions for selected questions" : "Message QuestGen"} placeholder={revisingSelection ? "Describe what to change — e.g. make Q3 more analytical, use a different example… (optional)" : workspaceMode === "exam" ? "Answer the current question, or tell me your exam requirements…" : !settings.model ? "Choose a model in the top bar to begin…" : "Ask a question, learn, or discuss any topic…"}/>
                 <div className="qg-composer-actions">
                   {editingMessageId ? (
                     <span className="qg-edit-help">Enter to save · Shift+Enter for new line · Esc to cancel</span>
@@ -1918,11 +1696,11 @@ export default function ChatPage() {
                 </div>
               </form>
               </>}
-              <div className="qg-compose-footer"><span>{workspaceMode === "exam" ? "EXAM · INTERACTIVE PAPER BUILDER" : workspaceMode === "agent" ? "AGENT · COURSE INVESTIGATION" : "QUESTGEN · GENERAL CHAT"}</span><span>Review AI-generated content before use</span></div>
+              <div className="qg-compose-footer"><span>{workspaceMode === "exam" ? "EXAM · INTERACTIVE PAPER BUILDER" : "QUESTGEN · GENERAL CHAT"}</span><span>Review AI-generated content before use</span></div>
             </div>
           </div>
           </div>
-          {((workspaceMode === "exam" && examIntroConfirmed) || (workspaceMode === "agent" && agentWorkflow?.status === "approved" && (agentWorkflow.kind === "exam" || agentWorkflow.kind === "question_bank"))) && examSession?.status === "approved" && <ExamPaperSidebar
+          {workspaceMode === "exam" && examIntroConfirmed && examSession?.status === "approved" && <ExamPaperSidebar
             paper={examPaper} requirements={examSession.requirements} busy={paperBusy}
             onEdit={(id, changes) => paperAction(`/questions/${id}`, "PATCH", changes)}
             onRemove={id => paperAction(`/questions/${id}`, "DELETE")}
