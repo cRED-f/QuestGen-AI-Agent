@@ -132,6 +132,8 @@ def init_db() -> None:
             "VALUES (1,'ollama','')"
         )
         provider_config.ensure_tables(conn)
+        from backend.agent import state as agent_state
+        agent_state.ensure_tables(conn)
         exam_state.ensure_tables(conn)
         exam_builder.ensure_tables(conn)
         exam_batch.ensure_tables(conn)
@@ -238,6 +240,10 @@ async def lifespan(_app: FastAPI):
         # their reservation without duplicating an accepted candidate.
         conn.execute("UPDATE exam_papers SET status='ready',generation_token=NULL,generation_started=NULL "
                      "WHERE status='generating'")
+        # A crash must never leave the reservation stuck forever; the
+        # checkpoint remains persisted so interrupted consultations can resume.
+        conn.execute("UPDATE agent_sessions SET status=CASE WHEN pending_question IS NOT NULL "
+                     "THEN 'awaiting_user' ELSE 'ready' END WHERE status='running'")
     for job_id in recovered:
         generation_queue.put_nowait(job_id)
     worker = asyncio.create_task(document_worker(queue))
@@ -318,6 +324,9 @@ class MessageInput(BaseModel):
         elif not self.content:
             raise ValueError("Message cannot be empty")
         return self
+
+
+from backend.agent.schemas import AgentTurnInput
 
 
 class SettingsInput(BaseModel):
@@ -421,6 +430,8 @@ def _delete_course_data(course_id: str) -> None:
 async def delete_course(course_id: str):
     with database() as conn:
         fetch_or_404(conn, "courses", course_id)
+        deleted_agent_threads = [row['id'] for row in conn.execute(
+            "SELECT id FROM threads WHERE course_id=?", (course_id,))]
         jobs = [row["id"] for row in conn.execute(
             "SELECT id FROM assessment_jobs WHERE course_id=?", (course_id,)
         )]
@@ -443,6 +454,11 @@ async def delete_course(course_id: str):
     except OSError as exc:
         raise HTTPException(status_code=409,
                             detail="Could not remove course files. Close programs using these files and try again.") from exc
+    try:
+        from backend.agent.checkpoints import purge
+        await purge(deleted_agent_threads)
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to purge deleted course agent checkpoints")
 
 
 @app.get("/api/threads")
@@ -492,6 +508,11 @@ async def delete_thread(thread_id: str):
         await asyncio.gather(*tasks, return_exceptions=True)
     with database() as conn:
         conn.execute("DELETE FROM threads WHERE id=?", (thread_id,))
+    try:
+        from backend.agent.checkpoints import purge
+        await purge([thread_id])
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to purge the deleted conversation's agent checkpoints")
 
 
 @app.get("/api/threads/{thread_id}/messages")
@@ -513,6 +534,172 @@ def list_messages(thread_id: str):
                 (message["id"],)
             ) if (src := documents.source_for_chunk(conn, row["chunk_id"]))]
         return messages
+
+
+# Agent Mode shares the existing threads and message timeline, but has a
+# separate checkpointed supervisor and never routes through ordinary chat.
+@app.get("/api/threads/{thread_id}/agent/status")
+def agent_status(thread_id: str):
+    from backend.agent import state as agent_state
+    with database() as conn:
+        fetch_or_404(conn, "threads", thread_id)
+        return agent_state.public(agent_state.get(conn, thread_id))
+
+
+@app.get("/api/threads/{thread_id}/agent/analysis")
+def agent_analysis(thread_id: str):
+    from backend.agent import academic, state as agent_state
+    with database() as conn:
+        thread = fetch_or_404(conn, "threads", thread_id)
+        entry = agent_state.get(conn, thread_id)
+        if entry and entry['scope_locked']:
+            ids = entry['document_ids']
+        else:
+            ids = []
+        course_id = thread['course_id']
+    return academic.snapshot(thread_id, course_id, ids)
+
+
+class ResearchPolicyInput(BaseModel):
+    mode: Literal['course_only', 'supplement', 'expand']
+    expansion_approved: bool = False
+
+
+@app.get('/api/threads/{thread_id}/agent/research-policy')
+def agent_research_policy(thread_id: str):
+    from backend.agent import research
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+    return research.policy(thread_id)
+
+
+@app.put('/api/threads/{thread_id}/agent/research-policy')
+def update_agent_research_policy(thread_id: str, data: ResearchPolicyInput):
+    from backend.agent import research, state as agent_state
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+        current = agent_state.get(conn, thread_id)
+        if current and current['status'] == 'running':
+            raise HTTPException(status_code=409, detail='Cannot modify research permissions during an active agent run')
+    try:
+        return research.set_policy(thread_id, data.mode, expansion_approved=data.expansion_approved)
+    except research.ResearchError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get('/api/threads/{thread_id}/agent/research-sources')
+def agent_research_sources(thread_id: str):
+    from backend.agent import research
+    with database() as conn:
+        thread = fetch_or_404(conn, 'threads', thread_id)
+    return research.sources(thread_id, thread['course_id'], limit=100)
+
+
+def get_agent_workflow_snapshot(thread_id: str):
+    from backend.agent import workflows
+    with database() as conn:
+        return workflows.latest(conn, thread_id)
+
+
+@app.get('/api/threads/{thread_id}/agent/workflow')
+def agent_workflow(thread_id: str):
+    from backend.agent import workflows
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+        return workflows.latest(conn, thread_id)
+
+
+class AgentWorkflowDecision(BaseModel):
+    approve: bool
+
+
+@app.post('/api/threads/{thread_id}/agent/workflow/{workflow_id}/decision')
+def decide_agent_workflow(thread_id: str, workflow_id: str, data: AgentWorkflowDecision):
+    from backend.agent import workflows
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+        plan = workflows.decide(conn, thread_id, workflow_id, approve=data.approve)
+        paper = exam_builder.read(conn, thread_id) if plan['kind'] in ('exam','question_bank') and data.approve else None
+        session = exam_state.read(conn, thread_id) if paper else None
+        return {'workflow': plan, 'paper': paper, 'exam_session': session}
+
+
+@app.post("/api/threads/{thread_id}/agent/turn")
+async def agent_turn(thread_id: str, data: "AgentTurnInput"):
+    from backend.agent import permissions, state as agent_state, supervisor
+    from backend.agent.errors import AgentFailure, classify
+    content = data.content.strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="Message cannot be empty")
+    with database() as conn:
+        thread = fetch_or_404(conn, "threads", thread_id)
+        settings = dict(conn.execute("SELECT provider,model FROM workspace_settings WHERE id=1").fetchone())
+        require_model(settings)
+        original = agent_state.get(conn, thread_id)
+        if original and original['scope_locked']:
+            ids = original['document_ids'] if data.document_ids is None else permissions.selected_documents(
+                conn, thread['course_id'], data.document_ids)
+            # Recheck that selected files still exist and are ready.
+            current = permissions.selected_documents(conn, thread['course_id'], ids)
+            if current != ids:
+                raise HTTPException(status_code=409, detail="Selected course materials changed")
+        else:
+            ids = permissions.selected_documents(conn, thread['course_id'], data.document_ids)
+        try:
+            previous, resume = agent_state.claim(conn, thread_id, ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        course_id = thread['course_id']
+    try:
+        # Long-running source analysis + research can legitimately take more
+        # than two minutes. Keep an explicit cap and surface timeout separately.
+        timeout_seconds = max(60, min(600, int(os.getenv('QUESTGEN_AGENT_TURN_TIMEOUT', '240'))))
+        reply, question, activity = await asyncio.wait_for(
+            supervisor.run_turn(thread_id, course_id, ids, settings, content, resume=resume),
+            timeout=timeout_seconds,
+        )
+    except asyncio.CancelledError:
+        with database() as conn:
+            agent_state.fail(conn, thread_id, previous)
+        raise
+    except Exception as exc:
+        with database() as conn:
+            agent_state.fail(conn, thread_id, previous)
+        fault = exc if isinstance(exc, AgentFailure) else classify(exc, 'agent_execution')
+        reference = uuid.uuid4().hex[:10]
+        logging.getLogger(__name__).error(
+            'Academic agent turn failed [ref=%s] [code=%s] [stage=%s] [provider=%s] [model=%s] [thread=%s]',
+            reference, fault.code, fault.stage, settings['provider'], settings['model'], thread_id,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=fault.status_code,
+            detail=f'{fault.guidance} (stage: {fault.stage}; reference: {reference})',
+            headers={'X-QuestGen-Error-Reference': reference},
+        ) from exc
+    user_id, assistant_id = identifier(), identifier()
+    with database() as conn:
+        # A course/thread may have been removed while a provider was running.
+        fetch_or_404(conn, "threads", thread_id)
+        timestamp = now()
+        for message_id, role, value, offset in ((user_id, 'user', content, 0),
+                                                (assistant_id, 'assistant', reply, 0.001)):
+            conn.execute("INSERT INTO messages(id,thread_id,role,content,created_at,mode) "
+                         "VALUES (?,?,?,?,?,'agent')", (message_id, thread_id, role, value, timestamp + offset))
+        for index, doc_id in enumerate(ids if not resume and data.document_ids else []):
+            conn.execute("INSERT INTO message_documents(message_id,document_id,position) VALUES (?,?,?)",
+                         (user_id, doc_id, index))
+        conn.execute("UPDATE threads SET updated_at=?,title=CASE WHEN title='New conversation' "
+                     "THEN ? ELSE title END WHERE id=?", (now(), content[:80], thread_id))
+        agent_state.finish(conn, thread_id, question=question, activity=activity)
+        state = agent_state.public(agent_state.get(conn, thread_id))
+    from backend.agent import academic, research, workflows
+    analysis = academic.snapshot(thread_id, course_id, ids)
+    return {'research_policy': research.policy(thread_id),
+            'research_sources': research.sources(thread_id, course_id),
+            'workflow': get_agent_workflow_snapshot(thread_id),
+            'user_id': user_id, 'message_id': assistant_id, 'reply': reply,
+            'sources': [], 'state': state, 'analysis': analysis}
 
 
 @app.get("/api/ingestion/status")
@@ -1777,7 +1964,7 @@ async def assessment_events(thread_id: str, job_id: str, after: int = 0):
                                       "X-Accel-Buffering": "no"})
 
 
-# --- Phase 4: individual versions, locks, reviews, conversation edits and exports ---
+# --- Question workflow: individual versions, locks, reviews, conversation edits and exports ---
 
 @app.get("/api/threads/{thread_id}/generations/{job_id}/questions/{question_id}/versions")
 def question_versions(thread_id: str, job_id: str, question_id: str):

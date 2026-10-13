@@ -1,4 +1,4 @@
-"""Phase 4 end-to-end route tests, no live LLM provider required."""
+"""End-to-end customization route tests, no live LLM provider required."""
 import io
 import json
 import time

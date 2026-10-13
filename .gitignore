@@ -50,3 +50,5 @@ next-env.d.ts
 !backend/.env.example
 
 /tasks/
+
+/backend/agent/__pycache__/

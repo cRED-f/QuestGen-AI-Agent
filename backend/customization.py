@@ -1,4 +1,4 @@
-"""Phase 4: professor-controlled question revisions, review and exports.
+"""Professor-controlled question revisions, review and exports.
 
 Every mutation is a SQLite transaction. Model work is outside the transaction and
 compared against the original version before commit; locks are always enforced.
@@ -85,7 +85,7 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
             created_at REAL NOT NULL
         );
     ''')
-    # Existing Phase 3 drafts are migrated lazily but deterministically.
+    # Existing assessment drafts are migrated lazily but deterministically.
     conn.execute('''INSERT OR IGNORE INTO assessment_question_versions
         (question_id,version,content,change_type,instruction,created_at)
         SELECT id,1,content,'generated','Initial question',created_at
