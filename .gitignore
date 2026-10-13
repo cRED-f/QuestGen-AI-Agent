@@ -48,3 +48,7 @@ next-env.d.ts
 
 # Allow checked-in examples without including actual secrets
 !backend/.env.example
+
+/tasks/
+
+/backend/agent/__pycache__/

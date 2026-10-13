@@ -23,7 +23,7 @@ from typing import AsyncIterator, Iterator, Literal
 import httpx
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response, JSONResponse
-from backend import documents, generation, customization, provider_config, exam_state, exam_tools, exam_agent, exam_builder, exam_batch
+from backend import documents, generation, customization, provider_config, exam_state, exam_tools, exam_agent, exam_builder, exam_batch, agent_mode, agent_drafts, agent_consultation
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -135,6 +135,8 @@ def init_db() -> None:
         exam_state.ensure_tables(conn)
         exam_builder.ensure_tables(conn)
         exam_batch.ensure_tables(conn)
+        agent_drafts.ensure_tables(conn)
+        agent_consultation.ensure_tables(conn)
         documents.ensure_tables(conn)
         generation.ensure_tables(conn)
         conn.executescript("""
@@ -146,10 +148,22 @@ def init_db() -> None:
             );
         """)
         customization.ensure_tables(conn)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS agent_web_sources (
+                message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                reference TEXT NOT NULL,
+                title TEXT NOT NULL,
+                url TEXT NOT NULL,
+                PRIMARY KEY(message_id,position)
+            );
+        """)
         # Existing message history remains Chat Mode by default. Exam turns share
         # the same thread but carry a mode label for clarity and context safety.
         if 'mode' not in {r[1] for r in conn.execute('PRAGMA table_info(messages)')}:
             conn.execute("ALTER TABLE messages ADD COLUMN mode TEXT NOT NULL DEFAULT 'chat'")
+        if 'agent_generate_from_plan' not in {r[1] for r in conn.execute('PRAGMA table_info(messages)')}:
+            conn.execute("ALTER TABLE messages ADD COLUMN agent_generate_from_plan INTEGER NOT NULL DEFAULT 0")
         if not was_initialized and not conn.execute("SELECT 1 FROM courses LIMIT 1").fetchone():
             conn.execute(
                 "INSERT INTO courses(id,name,created_at) VALUES (?,?,?)",
@@ -205,6 +219,7 @@ async def lifespan(_app: FastAPI):
     _app.state.exam_generation_tasks = {}
     # Live model-reasoning chunks per thread, streamed to the exam UI over SSE.
     _app.state.exam_reasoning = {}
+    _app.state.active_agent_threads = set()
     with database() as conn:
         pending = [row["id"] for row in conn.execute(
             "SELECT id FROM documents WHERE status IN ('queued','extracting','chunking','indexing')"
@@ -407,8 +422,7 @@ def _delete_course_data(course_id: str) -> None:
         if trash:
             shutil.rmtree(trash, ignore_errors=True)
         raise
-    # The DB transaction has committed; remove staged files and optional
-    # per-assessment agent checkpoints without touching other courses.
+    # The DB transaction has committed; remove staged uploads.
     if trash:
         try:
             shutil.rmtree(trash)
@@ -512,6 +526,9 @@ def list_messages(thread_id: str):
                 "SELECT chunk_id FROM message_sources WHERE message_id=? ORDER BY position",
                 (message["id"],)
             ) if (src := documents.source_for_chunk(conn, row["chunk_id"]))]
+            message["web_sources"] = [dict(r) for r in conn.execute(
+                "SELECT reference,title,url FROM agent_web_sources WHERE message_id=? ORDER BY position",
+                (message["id"],))]
         return messages
 
 
@@ -1067,6 +1084,278 @@ async def stream_message(thread_id: str, data: MessageInput):
     )
 
 
+
+# --- Agent Mode: consultation-first drafting, autonomous research and immediate SSE ---
+
+class AgentPlanApproval(BaseModel):
+    version: int = Field(ge=1)
+
+
+@app.get('/api/threads/{thread_id}/agent/plan')
+def get_agent_plan(thread_id: str):
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+        return agent_consultation.get_plan(conn, thread_id)
+
+
+@app.post('/api/threads/{thread_id}/agent/plan/approve')
+def approve_agent_plan(thread_id: str, payload: AgentPlanApproval):
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+        if thread_id in getattr(app.state, 'active_agent_threads', set()):
+            raise HTTPException(status_code=409, detail='Wait until the agent finishes discussing the plan')
+        return agent_consultation.approve(conn, thread_id, payload.version)
+
+
+
+class AgentTurnInput(MessageInput):
+    """Agent turns use Chat Mode's validated edit/regenerate contract."""
+    generate_from_plan: bool = False
+
+
+@app.post('/api/threads/{thread_id}/agent/stream')
+async def agent_stream(thread_id: str, payload: AgentTurnInput):
+    # Only quick SQLite operations precede SSE; all model and external tool
+    # work happens after the first event. Keep edits and message deletion in
+    # one transaction, so a rejected action cannot change saved history.
+    with database() as conn:
+        thread = fetch_or_404(conn, 'threads', thread_id)
+        settings = dict(conn.execute('SELECT provider,model FROM workspace_settings WHERE id=1').fetchone())
+        require_model(settings)
+        url, headers = model_credentials(settings)
+        if payload.document_ids is not None:
+            try:
+                documents.verify_course_documents(conn, thread['course_id'], payload.document_ids)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        active = getattr(app.state, 'active_agent_threads', None)
+        if active is None:
+            app.state.active_agent_threads = active = set()
+        if thread_id in active:
+            raise HTTPException(status_code=409, detail='Agent is already responding in this conversation')
+
+        rows = [dict(row) for row in conn.execute(
+            'SELECT rowid AS seq,id,role,mode,content,agent_generate_from_plan FROM messages WHERE thread_id=? ORDER BY rowid',
+            (thread_id,))]
+        target_id = payload.edit_message_id or payload.regenerate_message_id
+        selected: list[str] | None
+        user_id: str
+        content: str
+        history_rows: list[dict]
+        target: dict | None = None
+        if target_id:
+            target = next((row for row in rows if row['id'] == target_id), None)
+            role = 'user' if payload.edit_message_id else 'assistant'
+            # Do not allow Agent Mode controls to rewrite Chat/Exam messages
+            # or an identifier in another conversation.
+            if target is None or target['role'] != role or target['mode'] != 'agent':
+                raise HTTPException(status_code=404, detail=f'Agent {role} message not found')
+            if payload.edit_message_id:
+                user_id = target['id']
+                content = payload.content
+                history_rows = [row for row in rows if row['seq'] < target['seq']]
+            else:
+                preceding = [row for row in rows
+                             if row['seq'] < target['seq'] and row['role'] == 'user']
+                if not preceding or preceding[-1]['mode'] != 'agent':
+                    raise HTTPException(status_code=409, detail='No Agent Mode prompt exists for this reply')
+                original = preceding[-1]
+                user_id = original['id']
+                content = original['content']
+                history_rows = [row for row in rows if row['seq'] < original['seq']]
+        else:
+            user_id = identifier()
+            content = payload.content
+            history_rows = rows
+
+        # A regeneration reuses the stored file selection from the original
+        # prompt. Edits may change attachments; an omitted document_ids on an
+        # edit keeps the previously selected files, as in Chat Mode.
+        if payload.regenerate_message_id or (payload.edit_message_id and payload.document_ids is None):
+            previously_selected = [row['document_id'] for row in conn.execute(
+                'SELECT document_id FROM message_documents WHERE message_id=? ORDER BY position',
+                (user_id,))]
+            selected = previously_selected or None
+        else:
+            selected = payload.document_ids or None
+
+        # Restore an explicit earlier drafting grant on Regenerate, but never
+        # silently grant generation to edits or unrelated chat turns.
+        if payload.generate_from_plan and (payload.edit_message_id or payload.regenerate_message_id):
+            raise HTTPException(status_code=422, detail='Drafting cannot be combined with edit/regenerate')
+        authorized_generation = payload.generate_from_plan or bool(
+            payload.regenerate_message_id and original['agent_generate_from_plan'])
+        if authorized_generation and not agent_consultation.can_draft(conn, thread_id):
+            raise HTTPException(status_code=409, detail='Approve the latest consultation plan before drafting')
+        # Tools() only allocates per-turn budgets; instantiate before any
+        # destructive operations so synchronous setup errors preserve history.
+        tools = agent_mode.Tools(thread['course_id'], thread_id, selected, user_id,
+                                 allow_generation=authorized_generation)
+        history = [{'role': row['role'], 'content': row['content']} for row in history_rows]
+        active.add(thread_id)
+        stamp = now()
+        try:
+            if payload.edit_message_id:
+                # Preserve the user message ID but invalidate every later
+                # reply/turn and its source references (via FK cascades).
+                agent_drafts.discard_from_turn(conn, thread_id, user_id)
+                agent_consultation.invalidate_if_superseded(conn, thread_id,
+                    {user_id} | {r['id'] for r in rows if r['seq'] > target['seq']})
+                # Drafts from any later user turns also become invalid.
+                for later in rows:
+                    if later['seq'] > target['seq'] and later['role'] == 'user' and later['mode'] == 'agent':
+                        agent_drafts.discard_from_turn(conn, thread_id, later['id'])
+                conn.execute('DELETE FROM messages WHERE thread_id=? AND rowid>?',
+                             (thread_id, target['seq']))
+                conn.execute('UPDATE messages SET content=?,agent_generate_from_plan=0 WHERE id=?', (content, user_id))
+                if payload.document_ids is not None:
+                    conn.execute('DELETE FROM message_documents WHERE message_id=?', (user_id,))
+                    if selected:
+                        conn.executemany(
+                            'INSERT INTO message_documents(message_id,document_id,position) VALUES (?,?,?)',
+                            [(user_id, doc_id, index) for index, doc_id in enumerate(selected)])
+            elif payload.regenerate_message_id:
+                # Keep the original user turn; discard the selected assistant
+                # response and every later turn, just like Chat Mode.
+                agent_drafts.discard_from_turn(conn, thread_id, user_id)
+                agent_consultation.invalidate_if_superseded(conn, thread_id,
+                    {user_id} | {r['id'] for r in rows if r['seq'] >= target['seq']})
+                for later in rows:
+                    if later['seq'] > target['seq'] and later['role'] == 'user' and later['mode'] == 'agent':
+                        agent_drafts.discard_from_turn(conn, thread_id, later['id'])
+                conn.execute('DELETE FROM messages WHERE thread_id=? AND rowid>=?',
+                             (thread_id, target['seq']))
+            else:
+                conn.execute("INSERT INTO messages(id,thread_id,role,content,created_at,mode,agent_generate_from_plan) "
+                             "VALUES (?,?,'user',?,?,'agent',?)",
+                             (user_id, thread_id, content, stamp, int(authorized_generation)))
+                if selected:
+                    conn.executemany(
+                        'INSERT INTO message_documents(message_id,document_id,position) VALUES (?,?,?)',
+                        [(user_id, doc_id, index) for index, doc_id in enumerate(selected)])
+                if thread['title'] == 'New conversation':
+                    conn.execute('UPDATE threads SET title=? WHERE id=?', (content[:60], thread_id))
+            conn.execute('UPDATE threads SET updated_at=? WHERE id=?', (stamp, thread_id))
+        except Exception:
+            active.discard(thread_id)
+            raise
+
+    async def events() -> AsyncIterator[str]:
+        yield sse('started', user_id=user_id)
+        yield sse('status', message='Starting the agent…')
+        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=128)
+
+        async def produce():
+            try:
+                async for event in agent_mode.run_agent(settings, url, headers, history, content, tools):
+                    if event['type'] == 'final':
+                        final_text = event['content']
+                        message_id = identifier()
+                        with database() as conn:
+                            conn.execute("INSERT INTO messages(id,thread_id,role,content,created_at,mode) "
+                                         "VALUES (?,?,'assistant',?,?,'agent')",
+                                         (message_id, thread_id, final_text, now()))
+                            for index, source in enumerate(tools.course_sources):
+                                conn.execute("INSERT OR IGNORE INTO message_sources(message_id,chunk_id,position) "
+                                             "VALUES (?,?,?)", (message_id, source['chunk_id'], index))
+                            for index, source in enumerate(tools.web_sources):
+                                conn.execute('INSERT INTO agent_web_sources(message_id,position,reference,title,url) '
+                                             'VALUES (?,?,?,?,?)',
+                                             (message_id, index, source['reference'], source['title'], source['url']))
+                            conn.execute('UPDATE threads SET updated_at=? WHERE id=?', (now(), thread_id))
+                        await queue.put({'type': 'done', 'message_id': message_id})
+                    else:
+                        await queue.put(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.getLogger(__name__).exception('Agent request failed')
+                if isinstance(exc, (httpx.RequestError, httpx.TimeoutException)):
+                    message = 'Model provider is unreachable or timed out. Check its connection.'
+                elif isinstance(exc, RuntimeError) and str(exc).startswith(('Model provider returned', 'Model provider reported', 'Model returned', 'Model tool arguments exceeded')):
+                    message = str(exc)
+                else:
+                    message = 'Agent could not complete this turn. Check the backend log and model connection.'
+                await queue.put({'type': 'error', 'message': message})
+            finally:
+                active.discard(thread_id)
+                await queue.put({'type': '_end'})
+
+        worker = asyncio.create_task(produce())
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=3)
+                except asyncio.TimeoutError:
+                    yield ': keepalive\n\n'
+                    continue
+                if event['type'] == '_end':
+                    break
+                yield sse(event['type'], **{k: v for k, v in event.items() if k != 'type'})
+        finally:
+            if not worker.done():
+                worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            active.discard(thread_id)
+
+    return StreamingResponse(events(), media_type='text/event-stream',
+                             headers={'Cache-Control': 'no-cache, no-transform',
+                                      'X-Accel-Buffering': 'no', 'Connection': 'keep-alive'})
+
+
+# --- Agent Mode draft bank and explicit Exam Mode handoff ---
+
+class AgentDraftUpdate(BaseModel):
+    selected: bool | None = None
+    question: agent_drafts.AgentQuestion | None = None
+    version: int | None = Field(default=None, ge=1)
+
+
+class AgentHandoffInput(BaseModel):
+    question_ids: list[str] = Field(min_length=1, max_length=100)
+    replace: bool = False
+
+
+@app.get('/api/threads/{thread_id}/agent/questions')
+def get_agent_questions(thread_id: str):
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+        return agent_drafts.list_questions(conn, thread_id)
+
+
+@app.patch('/api/threads/{thread_id}/agent/questions/{question_id}')
+def change_agent_question(thread_id: str, question_id: str, data: AgentDraftUpdate):
+    if data.selected is None and data.question is None:
+        raise HTTPException(422, detail='Provide selected or question edits')
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+        return agent_drafts.update_question(conn, thread_id, question_id, selected=data.selected,
+            question=data.question.model_dump() if data.question is not None else None,
+            expected_version=data.version)
+
+
+@app.delete('/api/threads/{thread_id}/agent/questions/{question_id}', status_code=204)
+def delete_agent_question(thread_id: str, question_id: str):
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+        agent_drafts.remove_question(conn, thread_id, question_id)
+
+
+@app.post('/api/threads/{thread_id}/exam/import-agent-questions')
+def import_agent_questions(thread_id: str, data: AgentHandoffInput):
+    with database() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        return agent_drafts.import_selected(conn, thread_id, data.question_ids, replace=data.replace)
+
+
+@app.get('/api/threads/{thread_id}/exam/agent-handoff')
+def get_agent_handoff(thread_id: str):
+    with database() as conn:
+        fetch_or_404(conn, 'threads', thread_id)
+        return agent_drafts.read_handoff(conn, thread_id)
+
+
 # --- Exam Mode: persistent, professor-approved configuration ---
 
 class ExamTurnInput(BaseModel):
@@ -1088,6 +1377,8 @@ class ExamRequirementsInput(BaseModel):
 
 class ExamQuickReplyInput(ExamRequirementsInput):
     answer: str = Field(min_length=1, max_length=1500)
+    # Chip answers for a pending extracted-confirmation (True=save, False=discard).
+    confirm: bool | None = None
 
     @field_validator('answer')
     @classmethod
@@ -1157,15 +1448,46 @@ def quick_exam_reply(thread_id: str, data: ExamQuickReplyInput):
             exam_state.get_or_create(conn, thread_id, thread['course_id'],
                 context_summary=exam_tools.summarize_chat_context(conn, thread_id))
         updates = data.updates.model_dump(exclude_unset=True)
-        if not updates and data.document_ids is None:
+        if data.confirm is None and not updates and data.document_ids is None:
             raise HTTPException(status_code=422, detail='Select an exam answer before continuing')
-        session = exam_tools.save_exam_requirements(
-            conn, thread_id, thread['course_id'], updates, data.document_ids)
-        question = exam_tools.ask_professor(conn, thread_id)['question']
-        exam_state.set_next_question(conn,thread_id,question if session['missing'] else '')
-        session=exam_state.read(conn,thread_id)
+        pending_summary = None
+        if data.confirm is not None:
+            pending = (exam_state.read(conn, thread_id) or {}).get('pending_confirmation')
+            if data.confirm and pending:
+                session = exam_tools.save_exam_requirements(conn, thread_id, thread['course_id'], pending)
+            else:
+                session = exam_state.read(conn, thread_id)
+            exam_state.set_pending_confirmation(conn, thread_id, None)
+        else:
+            before = exam_state.read(conn, thread_id) or {}
+            merged = {**before.get('requirements', {}),
+                      **{k: v for k, v in updates.items() if v is not None}}
+            doc_ids = data.document_ids if data.document_ids is not None else before.get('document_ids', [])
+            if (updates and before.get('status') != 'approved'
+                    and not exam_state.missing(merged, doc_ids)):
+                # The last pre-set answer completes the setup: that moment always
+                # lands on an explicit "I heard: … save these?" sign-off turn.
+                exam_state.set_pending_confirmation(conn, thread_id, updates)
+                pending_summary = exam_agent._confirmation_summary(updates)
+            else:
+                session = exam_tools.save_exam_requirements(
+                    conn, thread_id, thread['course_id'], updates, data.document_ids)
+        if pending_summary is not None:
+            exam_state.set_next_question(conn, thread_id, pending_summary)
+            session = exam_state.read(conn, thread_id)
+            question = pending_summary
+            reply = pending_summary
+        else:
+            question = exam_tools.ask_professor(conn, thread_id)['question']
+            exam_state.set_next_question(conn,thread_id,question if session['missing'] else '')
+            session=exam_state.read(conn,thread_id)
         if session['status'] == 'approved':
             reply = 'Your exam setup is approved. We can now prepare the question-paper blueprint.'
+        elif data.confirm is True:
+            reply = (('Saved your exam details. ' + question) if session['missing']
+                     else 'I have everything needed. Review your exam details and confirm them to continue.')
+        elif data.confirm is False:
+            reply = 'Understood — I discarded those details. ' + question
         elif not session['missing']:
             reply = 'I have everything needed. Review your exam details and confirm them to continue.'
         else:
@@ -1285,6 +1607,29 @@ class CandidateInput(BaseModel):
 def get_exam_paper(thread_id: str):
     with database() as conn:
         fetch_or_404(conn, 'threads', thread_id)
+        return exam_builder.read(conn, thread_id)
+
+
+class PaperLayoutInput(BaseModel):
+    title: str = Field(min_length=3, max_length=160)
+    instructions: str = Field(max_length=800)
+
+
+@app.put('/api/threads/{thread_id}/exam/paper/layout')
+def update_exam_paper_layout(thread_id: str, data: PaperLayoutInput):
+    """Layout changes do not re-generate or reword imported questions."""
+    with database() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        fetch_or_404(conn, 'threads', thread_id)
+        current, _ = exam_builder._valid_paper(conn, thread_id, require_ready=True)
+        if current['status'] == 'generating':
+            raise HTTPException(409, detail='Cannot edit layout during question generation')
+        blueprint = exam_builder.Blueprint.model_validate_json(current['blueprint'])
+        changed = blueprint.model_copy(update={'title': data.title.strip(),
+                                                'instructions': data.instructions.strip()})
+        changed = exam_builder.Blueprint.model_validate(changed.model_dump())
+        conn.execute('UPDATE exam_papers SET blueprint=?, final_approved_at=NULL, final_signature=NULL, updated_at=? WHERE thread_id=?',
+                     (changed.model_dump_json(), now(), thread_id))
         return exam_builder.read(conn, thread_id)
 
 
@@ -1744,7 +2089,7 @@ async def assessment_events(thread_id: str, job_id: str, after: int = 0):
                                       "X-Accel-Buffering": "no"})
 
 
-# --- Phase 4: individual versions, locks, reviews, conversation edits and exports ---
+# --- Question workflow: individual versions, locks, reviews, conversation edits and exports ---
 
 @app.get("/api/threads/{thread_id}/generations/{job_id}/questions/{question_id}/versions")
 def question_versions(thread_id: str, job_id: str, question_id: str):

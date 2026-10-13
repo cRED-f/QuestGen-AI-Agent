@@ -37,7 +37,8 @@ test('activity reports estimated visible output only and is collapsible', () => 
   assert.match(page, /assistantActivity/);
   assert.match(page, /Math\.ceil\(\(stats\?\.visibleChars/);
   assert.match(page, /aria-expanded=\{expanded\}/);
-  assert.match(page, /not private model reasoning/);
+  assert.match(page, /reasoningText && <div className="qg-ai-reasoning">/);
+  assert.match(page, /output tokens/);
   assert.match(page, /Generating response/);
 });
 

@@ -1,4 +1,4 @@
-"""Phase 3 integration regression tests, with deterministic model doubles.
+"""Assessment integration regression tests, with deterministic model doubles.
 
 Real model integration requires installing Deep Agents and configuring a provider.
 """

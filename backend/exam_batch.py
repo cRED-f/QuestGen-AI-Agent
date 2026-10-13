@@ -363,7 +363,8 @@ async def generate(thread_id: str, *, draft_ids: list[str] | None = None,
     try:
         context = cached or await exam_context.build(session,blueprint,selected)
         if not cached:
-            context = await exam_planner.enrich(context,settings,session['requirements'])
+            context = await exam_planner.enrich(context,settings,session['requirements'],
+                                                course_id=session['course_id'])
         if not cached:
             with database() as conn:
                 valid = conn.execute('SELECT 1 FROM exam_papers WHERE thread_id=? AND generation_token=?',(thread_id,token)).fetchone()

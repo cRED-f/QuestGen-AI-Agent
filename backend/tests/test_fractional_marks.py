@@ -38,8 +38,13 @@ def test_half_mark_mix_is_saved_and_approved(client):
     assert response.json()['session']['missing'] == ['material_scope']
     saved = client.get(root).json()['requirements']['question_formats']
     assert saved == sections
+    completing = client.post(root+'/quick-reply', json={
+        'updates': {'material_scope': 'general'}, 'answer': 'General knowledge'})
+    assert completing.status_code == 200
+    # Completing the last pre-set answer requires the sign-off turn first.
+    assert completing.json()['session']['pending_confirmation'] == {'material_scope': 'general'}
     assert client.post(root+'/quick-reply', json={
-        'updates': {'material_scope': 'general'}, 'answer': 'General knowledge'}).status_code == 200
+        'updates': {}, 'answer': 'Yes, save these', 'confirm': True}).status_code == 200
     assert client.post(root+'/approve').status_code == 200
     prepared = client.post(root+'/paper/prepare')
     assert prepared.status_code == 200, prepared.text

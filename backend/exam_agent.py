@@ -95,6 +95,95 @@ def _simple_extract(message: str, missing: list[str]) -> dict:
     return {}
 
 
+_AFFIRMATIVE = re.compile(
+    r'^(?:yes|yep|yeah|yup|y|correct|right|sure|ok(?:ay)?|proceed|go ahead|looks? good|do it|'
+    r'confirm|save (?:it|these|them)(?: details)?)'
+    r'(?:[,.!]+(?:\s*save (?:it|these|them)(?: details)?)?)?\s*$', re.IGNORECASE)
+
+_KIND_PATTERNS = {
+    'mcq': r'\b(?:mcqs?|multiple[- ]choice)\b',
+    'short_answer': r'\bshort[- ]answers?\b',
+    'long_answer': r'\b(?:long[- ]answers?|essays?)\b',
+    'problem_solving': r'\b(?:problem[- ]solving|numericals?)\b',
+    'custom': r'\bcustom\b',
+}
+
+
+def _evidenced_fields(message: str, updates: dict) -> dict:
+    """Keep only proposal fields corroborated by the professor's own words.
+
+    The model decides WHAT was said; this decides WHETHER it was said. Loose
+    on purpose: word-form matches and number equality, not exact phrasing.
+    Explicit quick-reply answers never pass through here.
+    """
+    text = message.lower()
+    numbers = [float(n) for n in re.findall(r'\d+(?:\.\d+)?', message)]
+    kept: dict = {}
+    for field, value in updates.items():
+        if field == 'exam_type' and value in exam_state.EXAM_TYPES:
+            if (re.search(r'\b' + re.escape(value) + r's?\b', text)
+                    or (value == 'quiz' and re.search(r'\bquizzes\b', text))):
+                kept[field] = value
+        elif field == 'total_marks' and any(abs(n - float(value)) < 0.005 for n in numbers):
+            kept[field] = value
+        elif field == 'question_formats' and isinstance(value, list):
+            evidenced = []
+            for fmt in value:
+                if not isinstance(fmt, dict):
+                    continue
+                pattern = _KIND_PATTERNS.get(fmt.get('kind'))
+                count, marks = fmt.get('count'), fmt.get('marks_each')
+                if pattern and count is not None:
+                    near_count = (
+                        re.search(pattern + r'[^.!?]{0,60}?\b' + re.escape(str(int(count))) + r'\b', message, re.I)
+                        or re.search(r'\b' + re.escape(str(int(count))) + r'\b[^.!?]{0,40}?' + pattern, message, re.I))
+                    near_marks = marks is not None and any(abs(n - float(marks)) < 0.005 for n in numbers)
+                    if near_count or near_marks:
+                        evidenced.append(fmt)
+            if evidenced:
+                kept[field] = evidenced
+        elif field == 'difficulty' and value in exam_state.DIFFICULTIES:
+            base = str(value).rstrip('+')
+            if re.search(r'\b' + re.escape(base) + r'\w*', text):
+                kept[field] = value
+        elif field == 'faculty_initials' and re.search(r'\b' + re.escape(str(value)) + r'\b', message, re.I):
+            kept[field] = value
+        elif field in ('university_name', 'topic_scope') and str(value).lower() in text:
+            kept[field] = value
+        elif field == 'material_scope' and value in exam_state.SCOPE:
+            patterns = {'all_course': r'\b(?:all|every|uploaded)\b|\bcourse materials?\b',
+                        'general': r'\b(?:general(?: knowledge)?|no (?:materials?|uploads?))\b',
+                        'selected': r'\b(?:selected|specific|chosen|particular)\b'}
+            if re.search(patterns.get(value, r'\b' + re.escape(value) + r'\b'), text):
+                kept[field] = value
+    return kept
+
+
+def _confirmation_summary(updates: dict) -> str:
+    """One human-readable sign-off line for an extracted requirement set."""
+    parts = []
+    if updates.get('exam_type'):
+        parts.append(str(updates['exam_type']).replace('_', ' ').capitalize())
+    if updates.get('total_marks') is not None:
+        parts.append(f"{updates['total_marks']:g} marks")
+    for fmt in updates.get('question_formats') or []:
+        if isinstance(fmt, dict):
+            parts.append(f"{fmt.get('count')} {str(fmt.get('kind', '')).replace('_', ' ')} × {fmt.get('marks_each'):g}")
+    scope_names = {'all_course': 'all uploaded materials', 'selected': 'selected files',
+                   'general': 'general knowledge'}
+    if updates.get('material_scope') in scope_names:
+        parts.append(scope_names[updates['material_scope']])
+    if updates.get('difficulty'):
+        parts.append(f"difficulty {updates['difficulty']}")
+    if updates.get('university_name'):
+        parts.append(str(updates['university_name']))
+    if updates.get('faculty_initials'):
+        parts.append(f"initials {updates['faculty_initials']}")
+    if updates.get('topic_scope'):
+        parts.append(f"topic {updates['topic_scope']}")
+    return 'I heard: ' + ' · '.join(parts) + '. Should I save these as your exam setup?'
+
+
 async def propose_tool_calls(message: str, session: dict, settings: dict,
                              *, model_credentials, materials: list[dict] | None = None,
                              sources: list[dict] | None = None) -> list[tuple[str, dict]]:
@@ -188,14 +277,65 @@ async def process_turn(conn, thread_id: str, course_id: str, message: str, setti
     # Tool telemetry is written in the setup phase. Release its write lock
     # before the provider request so chats and document uploads stay responsive.
     conn.commit()
+    pending = session.get('pending_confirmation')
+    if pending and session['status'] != 'approved':
+        if _AFFIRMATIVE.match(message.strip()):
+            exam_state.set_pending_confirmation(conn, thread_id, None)
+            try:
+                session = exam_tools.save_exam_requirements(conn, thread_id, course_id, pending)
+            except Exception:
+                session = exam_tools.get_exam_requirements(conn, thread_id)
+                return session, 'Could not save those details. Please state your exam requirements again.', sources
+            missing = exam_tools.validate_exam_requirements(conn, thread_id)
+            next_step = exam_tools.ask_professor(conn, thread_id)
+            exam_state.set_next_question(conn, thread_id, next_step['question'] if missing else '')
+            session = exam_tools.get_exam_requirements(conn, thread_id)
+            reply = ('Saved your exam details. ' + next_step['question']) if missing else (
+                'Saved. I have the required configuration. Review the summary and select '
+                'Approve configuration when it is correct. I will not generate any questions '
+                'before your approval.')
+            return session, reply, sources
+        # Any other reply is a correction or new statement; drop the stale offer.
+        exam_state.set_pending_confirmation(conn, thread_id, None)
+        session = exam_tools.get_exam_requirements(conn, thread_id)
     proposals = await propose_tool_calls(message, session, settings, model_credentials=model_credentials,
                                          materials=materials, sources=sources)
-    # Freeform answers to the current question can still be stored without an
+    # Evidence gate: the model may only propose fields the professor actually
+    # said. Guesses are dropped here so the HITL question flow asks instead.
+    from_model = bool(proposals)
+    if proposals:
+        gated = []
+        for name, updates in proposals:
+            if name == 'save_exam_requirements':
+                evidenced = _evidenced_fields(message, updates)
+                if evidenced:
+                    gated.append(('save_exam_requirements', evidenced))
+        proposals = gated
+    # Freeform answers to the active question can still be stored without an
     # external model. Never guess multi-field values from unstructured prose.
     if not proposals:
         extracted = _simple_extract(message, session['missing'])
         if extracted:
             proposals = [('save_exam_requirements', extracted)]
+    if proposals and from_model and session['status'] != 'approved':
+        merged = {**session['requirements']}
+        for _, updates in proposals:
+            merged.update(updates)
+        if not exam_state.missing(merged, session['document_ids']):
+            # Completing the configuration requires an explicit sign-off turn.
+            stash: dict = {}
+            for _, updates in proposals:
+                stash.update(updates)
+            try:
+                exam_state.RequirementsPatch.model_validate(stash)
+            except Exception:
+                stash = {}  # invalid shape: fall through to per-field save/validation
+            if stash:
+                exam_state.set_pending_confirmation(conn, thread_id, stash)
+                summary = _confirmation_summary(stash)
+                exam_state.set_next_question(conn, thread_id, summary)
+                session = exam_tools.get_exam_requirements(conn, thread_id)
+                return session, summary, sources
     for name, updates in proposals:
         if name == 'save_exam_requirements':
             try:

@@ -1,23 +1,42 @@
 "use client";
 
 import { useState } from "react";
+import PaperActionDialog from "./PaperActionDialog";
 import FormattedMessage from "@/components/workspace/FormattedMessage";
 import { ArrowDown, ArrowUp, CheckCircle2, Download, Pencil, Trash2, FileText, Layers3, Eye, EyeOff } from "lucide-react";
 import type { ExamPaper, QuestionEdits } from "./ExamPaperBuilder";
 import type { ExamRequirements } from "./ExamConfiguration";
 import { QuestionFields } from "./ExamPaperBuilder";
 
-export default function ExamPaperSidebar({ paper, requirements, busy, onEdit, onRemove, onReorder, onFinalApprove, onDownload }: {
+export default function ExamPaperSidebar({ paper, requirements, busy, onEdit, onRemove, onReorder, onFinalApprove, onDownload, onLayout }: {
   paper: ExamPaper | null; requirements: ExamRequirements; busy: boolean;
   onEdit: (id: string, changes: QuestionEdits) => Promise<void>;
   onRemove: (id: string) => Promise<void>;
   onReorder: (ids: string[]) => Promise<void>;
-  onFinalApprove: () => Promise<void>;
+  onFinalApprove: () => Promise<boolean>;
+  onLayout?: (title: string, instructions: string) => Promise<void>;
   onDownload: (audience: "student" | "instructor", format: "pdf" | "docx") => Promise<void>;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingLayout, setEditingLayout] = useState(false);
+  const [title, setTitle] = useState("");
+  const [instructions, setInstructions] = useState("");
   const [showAnswers, setShowAnswers] = useState(false);
   const [downloadBusy, setDownloadBusy] = useState(false);
+  const [approvalOpen, setApprovalOpen] = useState(false);
+  const [approvalBusy, setApprovalBusy] = useState(false);
+  const [approvalError, setApprovalError] = useState("");
+  const approveFinalPaper = async () => {
+    if (approvalBusy || busy) return;
+    setApprovalBusy(true);
+    setApprovalError("");
+    try {
+      if (await onFinalApprove()) setApprovalOpen(false);
+      else setApprovalError("Approval could not be completed. Check the workspace message and try again.");
+    } catch (cause) {
+      setApprovalError(cause instanceof Error ? cause.message : "Could not approve paper.");
+    } finally { setApprovalBusy(false); }
+  };
   const download = async (audience: "student" | "instructor", format: "pdf" | "docx") => {
     setDownloadBusy(true);
     try { await onDownload(audience, format); } finally { setDownloadBusy(false); }
@@ -48,9 +67,21 @@ export default function ExamPaperSidebar({ paper, requirements, busy, onEdit, on
     </div>
     <div className="qg-paper-meter" role="progressbar" aria-valuenow={Math.round(completion)} aria-valuemin={0} aria-valuemax={100} aria-label="Paper completion"><span style={{width: `${completion}%`}}/></div>
     <div className="qg-paper-preview-label"><span><Eye size={14}/> LIVE PREVIEW</span><small>Updated on acceptance</small></div>
+    {onLayout && <div className="qg-paper-layout-tools">
+      <button type="button" disabled={busy} onClick={() => {setEditingLayout(value => !value);setTitle(paper.blueprint.title);setInstructions(paper.blueprint.instructions);}}>
+        <Pencil size={13}/> Edit paper title & instructions
+      </button>
+      {editingLayout && <form className="qg-paper-editor" onSubmit={event => {
+        event.preventDefault(); void onLayout(title, instructions).then(() => setEditingLayout(false));
+      }}>
+        <label>Paper title<input required minLength={3} maxLength={160} value={title} onChange={event => setTitle(event.target.value)}/></label>
+        <label>Instructions<textarea maxLength={800} value={instructions} onChange={event => setInstructions(event.target.value)}/></label>
+        <div className="qg-paper-actions"><button disabled={busy} type="submit">Save layout</button><button type="button" onClick={() => setEditingLayout(false)}>Cancel</button></div>
+      </form>}
+    </div>}
     <div className="qg-paper-sheet">
-      <header><span className="qg-sheet-university">{requirements.university_name || "University"}</span>
-        <h3>{paper.blueprint.title}</h3><small>{requirements.exam_type?.toUpperCase()} · Faculty: {requirements.faculty_initials}</small>
+      <header>{requirements.university_name && <span className="qg-sheet-university">{requirements.university_name}</span>}
+        <h3>{paper.blueprint.title}</h3><small>{requirements.exam_type?.toUpperCase()}{requirements.faculty_initials ? ` · Faculty: ${requirements.faculty_initials}` : ""}</small>
         <small>Full marks: {paper.total_marks}</small></header>
       <p className="qg-sheet-instructions">{paper.blueprint.instructions}</p>
       {paper.blueprint.sections.map((section,i) => {
@@ -79,9 +110,7 @@ export default function ExamPaperSidebar({ paper, requirements, busy, onEdit, on
       <h3><CheckCircle2 size={16}/> Final professor review</h3>
       <p>Verify every question, mark, and option above. Only accepted questions are included. Academic correctness is your responsibility.</p>
       {paper.final_approved ? <div className="qg-approved-message" role="status">Approved for download. Editing the paper requires approval again.</div>
-        : <button type="button" className="qg-paper-primary" disabled={busy} onClick={() => {
-          if (window.confirm("Approve the complete question paper as it appears in the preview? Any later edit will require reapproval.")) void onFinalApprove();
-        }}>Approve final paper</button>}
+        : <button type="button" className="qg-paper-primary" disabled={busy} onClick={() => { setApprovalError(""); setApprovalOpen(true); }}>Approve final paper</button>}
       <div className="qg-export-grid" aria-label="Download exam copies">
         {(["student", "instructor"] as const).map(audience => (["pdf", "docx"] as const).map(format =>
           <button type="button" key={`${audience}-${format}`} disabled={!paper.final_approved || busy || downloadBusy}
@@ -90,5 +119,20 @@ export default function ExamPaperSidebar({ paper, requirements, busy, onEdit, on
       </div>
       {!paper.final_approved && <small>Approve the completed paper to enable PDF and DOCX downloads.</small>}
     </section>}
+    {approvalOpen && !paper.final_approved && <PaperActionDialog
+      eyebrow="EXAM MODE · FINAL REVIEW"
+      title="Approve this question paper?"
+      description="Confirm that you've reviewed the content, marks and answer options in the live preview."
+      icon={<CheckCircle2 size={19}/>}
+      details={[{label: "Questions", value: String(paper.questions.length)},
+        {label: "Total marks", value: String(paper.total_marks)},
+        {label: "Paper status", value: "Ready for export"}]}
+      note="Any changes after approval will require another review before PDF or DOCX export."
+      confirmLabel="Approve paper"
+      error={approvalError}
+      busy={busy || approvalBusy}
+      onCancel={() => setApprovalOpen(false)}
+      onConfirm={() => void approveFinalPaper()}
+    />}
   </aside>;
 }

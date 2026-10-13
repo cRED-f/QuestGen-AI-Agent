@@ -1,7 +1,7 @@
 """Contract: progressive HITL exam configuration and an approval gate."""
 import pytest
 from fastapi.testclient import TestClient
-from backend import app as service, exam_agent
+from backend import app as service, exam_agent, exam_state
 
 
 @pytest.fixture
@@ -222,16 +222,29 @@ def test_quick_replies_advance_one_question_and_persist_as_messages(client):
          '10 MCQs and 6 short answers', 'material_scope'),
         ({'material_scope': 'general'}, 'General knowledge', None),
     ]
-    for updates, answer, next_field in choices:
+    for updates, answer, next_field in choices[:-1]:
         response = client.post(base + '/quick-reply', json={'updates': updates, 'answer': answer})
         assert response.status_code == 200, response.text
         session = response.json()['session']
         assert (session['missing'][0] if session['missing'] else None) == next_field
         assert response.json()['user_id'] and response.json()['message_id']
+    # The final pre-set answer lands on an explicit sign-off, not silent completion.
+    last_updates, last_answer, _ = choices[-1]
+    response = client.post(base + '/quick-reply', json={'updates': last_updates, 'answer': last_answer})
+    assert response.status_code == 200, response.text
+    session = response.json()['session']
+    assert session['missing'] == ['material_scope']
+    assert session['pending_confirmation'] == {'material_scope': 'general'}
+    assert session['status'] == 'collecting'
+    confirmed = client.post(base + '/quick-reply', json={
+        'updates': {}, 'answer': 'Yes, save these', 'confirm': True})
+    session = confirmed.json()['session']
     assert session['status'] == 'awaiting_approval'
+    assert session['pending_confirmation'] is None
     messages = client.get(f'/api/threads/{tid}/messages').json()
-    assert [m['role'] for m in messages] == ['user', 'assistant'] * len(choices)
-    assert [m['content'] for m in messages if m['role'] == 'user'] == [answer for _,answer,_ in choices]
+    assert [m['role'] for m in messages] == ['user', 'assistant'] * (len(choices) + 1)
+    assert [m['content'] for m in messages if m['role'] == 'user'] == \
+        [answer for _, answer, _ in choices] + ['Yes, save these']
     assert all(m['mode'] == 'exam' for m in messages)
     service.init_db()
     assert client.get(base).json()['requirements']['total_marks'] == 40
@@ -297,9 +310,13 @@ def test_custom_five_mark_mix_is_saved_and_advances_exam(client):
     history = client.get(f'/api/threads/{tid}/messages').json()
     assert history[-2]['role'] == 'user'
     assert 'Problem Solving' in history[-2]['content']
-    assert client.post(base + '/quick-reply', json={
-        'updates': {'material_scope': 'general'}, 'answer': 'General knowledge'
-    }).json()['session']['ready_for_approval'] is True
+    completed = client.post(base + '/quick-reply', json={
+        'updates': {'material_scope': 'general'}, 'answer': 'General knowledge'}).json()
+    assert completed['session']['ready_for_approval'] is False  # sign-off first
+    assert completed['session']['pending_confirmation'] == {'material_scope': 'general'}
+    confirmed = client.post(base + '/quick-reply', json={
+        'updates': {}, 'answer': 'Yes', 'confirm': True}).json()
+    assert confirmed['session']['ready_for_approval'] is True
 
 
 def test_invalid_custom_mix_is_rejected_without_creating_a_chat_turn(client):
@@ -315,3 +332,98 @@ def test_invalid_custom_mix_is_rejected_without_creating_a_chat_turn(client):
     })
     assert bad.status_code == 422
     assert client.get(f'/api/threads/{tid}/messages').json() == []
+
+
+def test_vague_message_saves_nothing_and_asks_first_question(client, monkeypatch):
+    """The extractor must never complete requirements from an un-evidenced guess."""
+    tid = make_thread(client)
+    client.post(f'/api/threads/{tid}/exam/start')
+
+    async def guessed(message, session, settings, **kwargs):
+        return [('save_exam_requirements', {'exam_type': 'midterm', 'total_marks': 50,
+                                            'question_formats': [{'kind': 'mcq', 'count': 10, 'marks_each': 5}],
+                                            'material_scope': 'all_course',
+                                            'university_name': 'State University'})]
+    monkeypatch.setattr(exam_agent, 'propose_tool_calls', guessed)
+    result = client.post(f'/api/threads/{tid}/exam/turn',
+                         json={'content': 'Make me an exam for my class please'})
+    assert result.status_code == 200
+    session = result.json()['session']
+    assert session['requirements'] == {}
+    assert session['pending_confirmation'] is None
+    assert session['missing'][0] == 'exam_type'
+    assert '?' in result.json()['reply']
+
+
+def test_completing_extraction_requires_explicit_confirmation(client, monkeypatch):
+    """A fully-stated message is summarized for sign-off before it completes the setup."""
+    tid = make_thread(client)
+    client.post(f'/api/threads/{tid}/exam/start')
+
+    async def inferred(message, session, settings, **kwargs):
+        return [('save_exam_requirements', {'exam_type': 'midterm', 'total_marks': 50,
+                                            'question_formats': [{'kind': 'mcq', 'count': 10, 'marks_each': 5}],
+                                            'material_scope': 'general'})]
+    monkeypatch.setattr(exam_agent, 'propose_tool_calls', inferred)
+    result = client.post(f'/api/threads/{tid}/exam/turn', json={
+        'content': 'My midterm is worth 50 marks with 10 MCQs each worth 5 marks, use general knowledge'})
+    session = result.json()['session']
+    assert session['requirements'] == {}          # nothing saved until the professor confirms
+    assert session['pending_confirmation'] is not None
+    assert 'Midterm' in result.json()['reply'] and '?' in result.json()['reply']
+    confirmed = client.post(f'/api/threads/{tid}/exam/turn', json={'content': 'Yes'}).json()
+    saved = confirmed['session']
+    assert saved['requirements']['exam_type'] == 'midterm'
+    assert saved['requirements']['total_marks'] == 50
+    assert saved['ready_for_approval'] is True
+    assert saved['pending_confirmation'] is None
+    assert client.post(f'/api/threads/{tid}/exam/approve').status_code == 200
+
+
+def test_rejection_discards_pending_and_processes_correction(client, monkeypatch):
+    tid = make_thread(client)
+    client.post(f'/api/threads/{tid}/exam/start')
+
+    async def proposer(message, session, settings, **kwargs):
+        if '60' in message and 'final' in message:
+            return [('save_exam_requirements', {'exam_type': 'final', 'total_marks': 60,
+                                                'question_formats': [
+                                                    {'kind': 'short_answer', 'count': 6, 'marks_each': 10}],
+                                                'material_scope': 'general'})]
+        return [('save_exam_requirements', {'exam_type': 'midterm', 'total_marks': 50,
+                                            'question_formats': [{'kind': 'mcq', 'count': 10, 'marks_each': 5}],
+                                            'material_scope': 'general'})]
+    monkeypatch.setattr(exam_agent, 'propose_tool_calls', proposer)
+    first = client.post(f'/api/threads/{tid}/exam/turn', json={
+        'content': 'A 50-mark midterm: 10 MCQs × 5 marks, general knowledge'}).json()
+    assert first['session']['pending_confirmation'] is not None
+    second = client.post(f'/api/threads/{tid}/exam/turn', json={
+        'content': 'No — make it a 60-mark final with 6 short answers x 10 marks, general knowledge'}).json()
+    assert second['session']['pending_confirmation'] is not None
+    assert '60' in str(second['session']['pending_confirmation'])
+    confirmed = client.post(f'/api/threads/{tid}/exam/turn', json={'content': 'yes, save these'}).json()
+    assert confirmed['session']['requirements']['exam_type'] == 'final'
+    assert confirmed['session']['requirements']['total_marks'] == 60
+    assert confirmed['session']['ready_for_approval'] is True
+
+
+def test_quick_reply_confirm_applies_or_discards_pending(client):
+    tid = make_thread(client)
+    base = f'/api/threads/{tid}/exam'
+    client.post(base + '/start')
+    with service.database() as conn:
+        exam_state.set_pending_confirmation(conn, tid, {'exam_type': 'quiz', 'total_marks': 20})
+    confirmed = client.post(base + '/quick-reply', json={
+        'updates': {}, 'answer': 'Yes, save these', 'confirm': True})
+    assert confirmed.status_code == 200, confirmed.text
+    session = confirmed.json()['session']
+    assert session['requirements']['exam_type'] == 'quiz'
+    assert session['pending_confirmation'] is None
+    # A fresh pending offer is discarded by confirm=false without touching saved fields.
+    with service.database() as conn:
+        exam_state.set_pending_confirmation(conn, tid, {'total_marks': 99})
+    declined = client.post(base + '/quick-reply', json={
+        'updates': {}, 'answer': "No, I'll rephrase", 'confirm': False})
+    assert declined.status_code == 200, declined.text
+    assert declined.json()['session']['pending_confirmation'] is None
+    assert declined.json()['session']['requirements'].get('total_marks') == 20
