@@ -10,6 +10,7 @@ import {
   ArrowDown,
   ChevronDown,
   Activity,
+  BrainCircuit,
   Files,
   Eye,
   EyeOff,
@@ -43,8 +44,9 @@ import { DocumentPanel, type CourseMaterial, Source, sourceLink, sourceLocation 
 import QuestionEditor, { type AssessmentQuestion } from "@/components/workspace/QuestionEditor";
 import PencilSelect from "@/components/workspace/PencilSelect";
 import ExamConfiguration, { type ExamSession, type ExamRequirements } from "@/components/workspace/ExamConfiguration";
-import ExamPaperBuilder, { type ExamPaper, type PaperBlueprint, type QuestionEdits } from "@/components/workspace/ExamPaperBuilder";
+import ExamPaperBuilder, { QuestionFields, type ExamPaper, type PaperBlueprint, type PaperQuestionContent, type QuestionEdits } from "@/components/workspace/ExamPaperBuilder";
 import ExamPaperSidebar from "@/components/workspace/ExamPaperSidebar";
+import PaperActionDialog from "@/components/workspace/PaperActionDialog";
 
 type Course = { id: string; name: string; created_at: number };
 type Thread = { id: string; course_id: string; title: string; updated_at: number };
@@ -53,10 +55,22 @@ type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   created_at: number;
-  mode?: "chat" | "exam";
+  mode?: "chat" | "agent" | "exam";
+  web_sources?: {reference: string; title: string; url: string}[];
   sources?: Source[];
   documents?: CourseMaterial[];
 };
+type AgentDraft = {
+  id: string; thread_id: string; position: number; selected: boolean; version: number;
+  content: PaperQuestionContent;
+  document_ids: string[];
+};
+type AgentPlan = {
+  thread_id: string; origin_message_id: string | null; version: number;
+  status: "pending" | "approved"; updated_at: number;
+  plan: {summary: string; details: {label: string; value: string}[]};
+};
+type AgentHandoff = { question_ids: string[]; conversation: ChatMessage[]; created_at: number };
 type AssessmentActivity = { id: number; stage: string; message: string; progress: number };
 type AssessmentJob = {
   id: string;
@@ -99,12 +113,16 @@ const PROVIDERS: { value: ModelSettings["provider"]; label: string; detail: stri
   { value: "ollama", label: "Ollama", detail: "Models installed locally" },
 ];
 type ChatEvent = {
-  type: "started" | "sources" | "delta" | "reasoning" | "done" | "error";
+  type: "started" | "sources" | "delta" | "reasoning" | "done" | "error" | "status" | "activity" | "plan";
   sources?: Source[];
+  web_sources?: {reference: string; title: string; url: string}[];
+  name?: string;
+  stage?: "started" | "completed";
   user_id?: string;
   message_id?: string;
   content?: string;
   message?: string;
+  plan?: AgentPlan;
 };
 
 type ExamGenerationStatus = {
@@ -205,9 +223,22 @@ export default function ChatPage() {
   const [assistantActivity, setAssistantActivity] = useState<Record<string, {started: number; visibleChars: number; done?: boolean}>>({});
   // Streamed model thinking, keyed by message id; display-only, never persisted.
   const [assistantReasoning, setAssistantReasoning] = useState<Record<string, string>>({});
+  const [agentDrafts, setAgentDrafts] = useState<AgentDraft[]>([]);
+  const [agentPlan, setAgentPlan] = useState<AgentPlan | null>(null);
+  const [agentPlanBusy, setAgentPlanBusy] = useState(false);
+  const [agentDraftEditingId, setAgentDraftEditingId] = useState<string | null>(null);
+  const [agentExpandedDraftId, setAgentExpandedDraftId] = useState<string | null>(null);
+  const [agentDraftBusy, setAgentDraftBusy] = useState(false);
+  const [handoffConfirmation, setHandoffConfirmation] = useState<{ questionIds: string[]; threadId: string; replace: boolean } | null>(null);
+  const [handoffProblem, setHandoffProblem] = useState("");
+  useEffect(() => { setHandoffConfirmation(null); setHandoffProblem(""); }, [threadId]);
+  const [showAgentAnswers, setShowAgentAnswers] = useState(false);
+  const [agentHandoff, setAgentHandoff] = useState<AgentHandoff | null>(null);
+  const [agentStatus, setAgentStatus] = useState<Record<string, string>>({});
+  const [agentActivities, setAgentActivities] = useState<Record<string, string[]>>({});
   const [activityNow, setActivityNow] = useState(() => Date.now());
 
-  const [workspaceMode, setWorkspaceMode] = useState<"chat" | "exam">("chat");
+  const [workspaceMode, setWorkspaceMode] = useState<"chat" | "agent" | "exam">("chat");
   const [examIntroConfirmed, setExamIntroConfirmed] = useState(false);
   const [examSession, setExamSession] = useState<ExamSession | null>(null);
   const [examBusy, setExamBusy] = useState(false);
@@ -267,6 +298,7 @@ export default function ChatPage() {
   const textRef = useRef<HTMLTextAreaElement | null>(null);
   const savedComposerDraftRef = useRef("");
   const chatDraftRef = useRef("");
+  const agentDraftRef = useRef("");
   const examDraftRef = useRef("");
   const savedAttachmentsRef = useRef<CourseMaterial[]>([]);
   const activeCourseRef = useRef("");
@@ -396,7 +428,7 @@ export default function ChatPage() {
     setShowScrollDown(false);
     setWorkspaceMode((() => {
       const saved = window.localStorage.getItem(`questgen:mode:${courseId}`);
-      return saved === "exam" ? "exam" : "chat";
+      return saved === "exam" || saved === "agent" ? saved : "chat";
     })());
     setExamIntroConfirmed(false);
     setThreads([]);
@@ -405,8 +437,12 @@ export default function ChatPage() {
     setAttachedDocuments([]);
     savedAttachmentsRef.current = [];
     chatDraftRef.current = "";
+    agentDraftRef.current = "";
     examDraftRef.current = "";
     setThreadId(null);
+    setAgentPlan(null);
+    setAgentExpandedDraftId(null);
+    setAgentDraftEditingId(null);
     setExamSession(null);
     setExamIntroConfirmed(false);
     setExamPaper(null);
@@ -557,6 +593,7 @@ export default function ChatPage() {
     if (busy) return;
     setExamIntroConfirmed(false);
     setThreadId(null);
+    setAgentPlan(null);
     setExamSession(null);
     setExamPaper(null);
     setMessages([]);
@@ -580,6 +617,7 @@ export default function ChatPage() {
     setShowScrollDown(false);
     setError("");
     setThreadId(id);
+    setAgentPlan(null);
     setExamSession(null);
     setExamPaper(null);
     setEditingMessageId(null);
@@ -596,6 +634,96 @@ export default function ChatPage() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load conversation.");
     }
+  };
+
+  const refreshAgentPlan = useCallback(async (id: string) => {
+    const plan = await requestJson<AgentPlan | null>(`/threads/${id}/agent/plan`);
+    setAgentPlan(plan);
+    return plan;
+  }, []);
+
+  const refreshAgentDrafts = useCallback(async (id: string) => {
+    const list = await requestJson<AgentDraft[]>(`/threads/${id}/agent/questions`);
+    setAgentDrafts(list);
+    return list;
+  }, []);
+
+  useEffect(() => {
+    setAgentExpandedDraftId(null);
+    setAgentDraftEditingId(null);
+    if (!threadId) { setAgentDrafts([]); setAgentHandoff(null); setAgentPlan(null); return; }
+    let active = true;
+    requestJson<AgentDraft[]>(`/threads/${threadId}/agent/questions`)
+      .then(items => { if (active) setAgentDrafts(items); }).catch(() => {});
+    requestJson<AgentPlan | null>(`/threads/${threadId}/agent/plan`)
+      .then(value => { if (active) setAgentPlan(value); }).catch(() => {});
+    requestJson<AgentHandoff | null>(`/threads/${threadId}/exam/agent-handoff`)
+      .then(value => { if (active) setAgentHandoff(value); }).catch(() => {});
+    return () => { active = false; };
+  }, [threadId]);
+
+  const updateAgentDraft = async (draft: AgentDraft, changes: {selected?: boolean; question?: PaperQuestionContent}) => {
+    if (!threadId || agentDraftBusy || busy) return;
+    setAgentDraftBusy(true);
+    setError("");
+    try {
+      await requestJson(`/threads/${threadId}/agent/questions/${draft.id}`, {
+        method: "PATCH", body: JSON.stringify({...changes, version: draft.version}),
+      });
+      await refreshAgentDrafts(threadId);
+      setAgentDraftEditingId(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not update question.");
+    } finally { setAgentDraftBusy(false); }
+  };
+
+  const deleteAgentDraft = async (draft: AgentDraft) => {
+    if (!threadId || busy || agentDraftBusy) return;
+    setAgentDraftBusy(true);
+    try {
+      await requestJson(`/threads/${threadId}/agent/questions/${draft.id}`, {method: "DELETE"});
+      await refreshAgentDrafts(threadId);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not delete question."); }
+    finally { setAgentDraftBusy(false); }
+  };
+
+  const openHandoffConfirmation = () => {
+    if (!threadId || agentDraftBusy || busy) return;
+    const questionIds = agentDrafts.filter(item => item.selected).map(item => item.id);
+    if (!questionIds.length) { setError("Select at least one question first."); return; }
+    setError("");
+    setHandoffProblem("");
+    setHandoffConfirmation({ questionIds, threadId, replace: false });
+  };
+
+  const formatSelectedInExam = async () => {
+    const confirmation = handoffConfirmation;
+    if (!confirmation || confirmation.threadId !== threadId || agentDraftBusy || busy) return;
+    setAgentDraftBusy(true);
+    setHandoffProblem("");
+    try {
+      const result = await requestJson<{session: ExamSession; paper: ExamPaper; handoff: AgentHandoff}>(
+        `/threads/${confirmation.threadId}/exam/import-agent-questions`, {
+          method: "POST", body: JSON.stringify({ question_ids: confirmation.questionIds, replace: confirmation.replace }),
+        });
+      setExamSession(result.session);
+      setExamPaper(result.paper);
+      setAgentHandoff(result.handoff);
+      setExamIntroConfirmed(true);
+      window.localStorage.setItem(examIntroKey(confirmation.threadId), "true");
+      if (courseId) window.localStorage.setItem(`questgen:mode:${courseId}`, "exam");
+      setHandoffConfirmation(null);
+      setWorkspaceMode("exam");
+      setInput(examDraftRef.current);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : "Could not format selected questions.";
+      if (!confirmation.replace && message.includes("An exam paper already exists")) {
+        // A server-side 409, not guessed local state, tells us replacement is needed.
+        setHandoffConfirmation({ ...confirmation, replace: true });
+      } else {
+        setHandoffProblem(message);
+      }
+    } finally { setAgentDraftBusy(false); }
   };
 
   // Morph only the composer/confirmation surface. The View Transitions API
@@ -616,15 +744,16 @@ export default function ChatPage() {
   };
 
   // The selected mode belongs to the workspace, not a new conversation.
-  const switchMode = async (mode: "chat" | "exam") => {
+  const switchMode = async (mode: "chat" | "agent" | "exam") => {
     if (busy || examBusy || paperBusy || startingExam || editingMessageId || mode === workspaceMode) return;
     if (workspaceMode === "chat") chatDraftRef.current = input;
+    else if (workspaceMode === "agent") agentDraftRef.current = input;
     else examDraftRef.current = input;
     const nextConfirmed = mode === "exam" ? introAlreadyConfirmed(threadId) : examIntroConfirmed;
     const currentHasIntro = workspaceMode === "exam" && !examIntroConfirmed;
     const nextHasIntro = mode === "exam" && !nextConfirmed;
     const updateMode = () => {
-      setInput(mode === "exam" ? examDraftRef.current : chatDraftRef.current);
+      setInput(mode === "exam" ? examDraftRef.current : mode === "agent" ? agentDraftRef.current : chatDraftRef.current);
       setExamIntroConfirmed(nextConfirmed);
       setWorkspaceMode(mode);
       setError("");
@@ -1042,12 +1171,12 @@ export default function ChatPage() {
   // Persisted message IDs are used so the backend can update the correct turn.
   const send = async (
     value = input,
-    action?: { edit_message_id?: string; regenerate_message_id?: string },
+    action?: { edit_message_id?: string; regenerate_message_id?: string; generate_from_plan?: boolean },
   ) => {
     const content = value.trim();
     if ((!content && !action?.regenerate_message_id) || !courseId || busy || examBusy || startingExam ||
         (editingMessageId !== null && action?.edit_message_id !== editingMessageId)) return;
-    if (action && (!threadId || workspaceMode !== "chat")) return;
+    if (action && (!threadId || (workspaceMode !== "chat" && workspaceMode !== "agent"))) return;
     const existingId = threadId;
     setBusy(true);
     setError("");
@@ -1108,7 +1237,7 @@ export default function ChatPage() {
         setMessages(previous => previous.map(item => item.id === user.id ? {...item, id: result.user_id}
           : item.id === answer.id ? {...item, id: result.message_id, content: result.reply, sources: result.sources} : item));
       } else {
-      const response = await fetch(`${API}/threads/${activeId}/stream`, {
+      const response = await fetch(`${API}/threads/${activeId}/${workspaceMode === "agent" ? "agent/stream" : "stream"}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1131,11 +1260,28 @@ export default function ChatPage() {
         }
         if (event.type === "sources") {
           setMessages((previous) => previous.map((item) => item.id === answer.id
-            ? { ...item, sources: event.sources || [] } : item));
+            ? { ...item, sources: event.sources || [], web_sources: event.web_sources || [] } : item));
+        }
+        if (event.type === "plan" && event.plan) {
+          setAgentPlan(event.plan);
+        }
+        if (event.type === "status") {
+          setAgentStatus(previous => ({...previous, [answer.id]: event.message || "Working…"}));
+        }
+        if (event.type === "activity") {
+          const title = event.name === "search_web" ? "Checked public websites"
+            : event.name === "search_course_materials" ? "Searched course materials"
+            : event.name === "list_course_documents" ? "Reviewed course file list"
+            : event.name === "propose_question_plan" ? "Proposed a question plan"
+            : event.name === "draft_questions" ? "Saved new question drafts"
+            : event.name === "revise_draft_question" ? "Revised a draft question" : "Used a tool";
+          if (event.stage === "completed") setAgentActivities(previous => ({...previous,
+            [answer.id]: [...(previous[answer.id] || []), title].slice(-8)}));
+          else setAgentStatus(previous => ({...previous, [answer.id]: title + "…"}));
         }
         if (event.type === "reasoning") {
           setAssistantReasoning(previous => ({...previous, [answer.id]:
-            ((previous[answer.id] || "") + (event.content || "")).slice(0, 12000)}));
+            (previous[answer.id] || "") + (event.content || "")}));
         }
         if (event.type === "delta") {
           setAssistantActivity(previous => ({...previous, [answer.id]: {
@@ -1151,6 +1297,8 @@ export default function ChatPage() {
           setActivityExpanded(previous => ({...previous, [event.message_id!]: previous[answer.id] !== false}));
           setAssistantReasoning(previous => previous[answer.id] === undefined ? previous
             : {...previous, [event.message_id!]: previous[answer.id]});
+          setAgentActivities(previous => ({...previous, [event.message_id!]: previous[answer.id] || []}));
+          setAgentStatus(previous => ({...previous, [event.message_id!]: "Finished"}));
           setMessages((previous) => previous.map((item) => item.id === answer.id ? { ...item, id: event.message_id! } : item));
         }
       });
@@ -1180,6 +1328,9 @@ export default function ChatPage() {
             refreshThreads(courseId),
           ]);
           setMessages(saved);
+          if (workspaceMode === "agent") {
+            await Promise.all([refreshAgentDrafts(activeId), refreshAgentPlan(activeId)]);
+          }
         } catch { /* Keep local content and display the preceding error if any. */ }
       } else {
         setMessages((previous) => previous.filter((item) => item.id !== answer.id));
@@ -1188,8 +1339,28 @@ export default function ChatPage() {
     }
   };
 
+  const approvePlanAndDraft = async () => {
+    if (!threadId || !agentPlan || agentPlan.status !== "pending" || busy || agentPlanBusy || editingMessageId) return;
+    setAgentPlanBusy(true);
+    setError("");
+    try {
+      const approved = await requestJson<AgentPlan>(`/threads/${threadId}/agent/plan/approve`, {
+        method: "POST", body: JSON.stringify({version: agentPlan.version}),
+      });
+      setAgentPlan(approved);
+      // User approval is explicit. Now the runtime's guarded drafting tool can run.
+      // Preserve the unsent composer text; this is a separate approved action.
+      const unsent = input;
+      await send("Generate the question drafts from the approved plan and our consultation. Save them in Agent Mode for my review.", {generate_from_plan: true});
+      setInput(unsent);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not approve the plan.");
+    } finally { setAgentPlanBusy(false); }
+  };
+
   const editChatMessage = (message: ChatMessage) => {
-    if (busy || startingExam || workspaceMode !== "chat" || message.id.startsWith("pending-")) return;
+    if (busy || startingExam || (workspaceMode !== "chat" && workspaceMode !== "agent") ||
+        (message.mode || "chat") !== workspaceMode || message.role !== "user" || message.id.startsWith("pending-")) return;
     // Keep the unsent draft so Cancel (or a completed edit) can restore it.
     if (!editingMessageId) {
       savedComposerDraftRef.current = input;
@@ -1420,6 +1591,7 @@ export default function ChatPage() {
           <div className="qg-mode-switch" data-mode={workspaceMode} role="group" aria-label="Workspace mode">
             <span className="qg-mode-switch-indicator" aria-hidden="true"/>
             <button type="button" aria-pressed={workspaceMode === "chat"} onClick={() => void switchMode("chat")} disabled={busy || examBusy}><MessageSquareText size={15}/> Chat</button>
+            <button type="button" aria-pressed={workspaceMode === "agent"} onClick={() => void switchMode("agent")} disabled={busy || examBusy}><BrainCircuit size={15}/> Agent</button>
             <button type="button" aria-pressed={workspaceMode === "exam"} onClick={() => void switchMode("exam")} disabled={busy || examBusy}><ClipboardList size={15}/> Exam</button>
           </div>
           <div className="qg-topbar-right">
@@ -1459,6 +1631,12 @@ export default function ChatPage() {
                     <ArrowRight size={16}/>
                   </button>
                 </div>
+              ) : messages.length === 0 && workspaceMode === "agent" ? (
+                <div className="qg-exam-empty" aria-label="Agent workspace">
+                  <div className="qg-exam-empty-symbol"><BrainCircuit size={24}/></div>
+                  <h1>What should we create?</h1>
+                  <p>Discuss your exam, create and revise complete questions here, then select which ones to format or print in Exam Mode. Course research happens automatically when needed.</p>
+                </div>
               ) : messages.length === 0 && workspaceMode === "exam" ? (
                 <div className="qg-exam-empty" aria-label="Exam assistant">
                   <div className="qg-exam-empty-symbol"><ClipboardList size={24}/></div>
@@ -1494,12 +1672,26 @@ export default function ChatPage() {
                                 </button>
                                 {expanded && <div className="qg-ai-activity-detail">
                                   {reasoningText && <div className="qg-ai-reasoning">{reasoningText}</div>}
-                                  {isPending ? (reasoningText ? "Model is thinking…" : "Searching context and preparing an answer…") : "Response completed."}{" "}
-                                  {reasoningText ? "Token count is an estimate of visible output; the text above is streamed model reasoning." : "Token count is an estimate of visible output, not private model reasoning."}
+                                  {(agentActivities[message.id] || []).map((step, index) => <div key={index} className="qg-agent-activity-step">{step}</div>)}
+                                  {message.mode === "agent" || (workspaceMode === "agent" && isPending)
+                                    ? (isPending ? (agentStatus[message.id] || "Contacting the model…") : "Response completed.")
+                                    : isPending ? (reasoningText ? "Model is thinking…" : "Searching context and preparing an answer…") : "Response completed."}
+                                  {reasoningText && <div className="qg-ai-activity-note">Streamed model reasoning</div>}
                                 </div>}
                               </div>;
                             })()}
                             {message.content ? <FormattedMessage content={message.content}/> : <span className="qg-thinking"><Loader2 size={15} className="qg-spin"/> QuestGen is preparing a response…</span>}
+                            {!!message.web_sources?.length && (
+                              <div className="qg-citations">
+                                <div className="qg-citations-title"><BookOpenText size={15}/> WEB REFERENCES</div>
+                                <div className="qg-citation-list">
+                                  {message.web_sources.map(source => <a key={source.reference} className="qg-citation"
+                                    href={source.url} target="_blank" rel="noopener noreferrer" title={source.url}>
+                                    <span>{source.reference}</span> {source.title}<ArrowUpRight size={13}/>
+                                  </a>)}
+                                </div>
+                              </div>
+                            )}
                             {!!message.sources?.length && (
                               <div className="qg-citations">
                                 <div className="qg-citations-title"><BookOpenText size={15}/> REFERENCED MATERIAL</div>
@@ -1537,7 +1729,7 @@ export default function ChatPage() {
                                 <span>{copyFeedback?.id === message.id ? (copyFeedback.status === "copied" ? "Copied" : "Copy failed") : "Copy"}</span>
                               </button>
                             )}
-                            {workspaceMode === "chat" && (message.mode || "chat") === "chat" && !busy && !startingExam && !editingMessageId && !message.id.startsWith("pending-") && (message.role === "user" ? (
+                            {(workspaceMode === "chat" || workspaceMode === "agent") && (message.mode || "chat") === workspaceMode && !busy && !startingExam && !editingMessageId && !message.id.startsWith("pending-") && (message.role === "user" ? (
                               <button type="button" onClick={() => editChatMessage(message)} title="Edit this message" aria-label="Edit message">
                                 <Pencil size={14}/> <span>Edit</span>
                               </button>
@@ -1600,6 +1792,131 @@ export default function ChatPage() {
           </section>
           {showScrollDown && <button type="button" className="qg-scroll-latest" onClick={() => scrollToLatest(true)} aria-label="Scroll to latest message" title="Jump to latest message"><ArrowDown size={19} aria-hidden="true"/></button>}
 
+          {workspaceMode === "agent" && agentPlan && (agentPlan.status === "pending" || agentDrafts.length === 0) && <section className={`qg-agent-consult-plan ${agentDrafts.length ? "qg-agent-consult-plan--with-drafts" : ""}`} aria-label="Proposed question plan">
+            <div className="qg-agent-plan-intro">
+              <div className="qg-agent-plan-identity">
+                <span className="qg-agent-plan-icon" aria-hidden="true"><ClipboardList size={18}/></span>
+                <div className="qg-agent-plan-title">
+                  <span className="qg-agent-plan-kicker">QUESTION PLAN</span>
+                  <h2>{agentPlan.status === "pending" ? "Your assessment plan" : "Plan approved"}</h2>
+                </div>
+              </div>
+              <span className={`qg-agent-plan-status ${agentPlan.status === "approved" ? "qg-agent-plan-status--approved" : ""}`}>
+                {agentPlan.status === "approved" ? <Check size={13} aria-hidden="true"/> : <span className="qg-agent-plan-status-dot" aria-hidden="true"/>}
+                {agentPlan.status === "pending" ? "Ready for review" : "Approved"}
+              </span>
+            </div>
+            <p className="qg-agent-plan-summary">{agentPlan.plan.summary}</p>
+            {agentPlan.plan.details.length > 0 && <details key={`${agentPlan.thread_id}-${agentPlan.version}`} className="qg-agent-plan-disclosure">
+              <summary>
+                <span>Plan details <small>{agentPlan.plan.details.length} items</small></span>
+                <ChevronDown size={16} aria-hidden="true"/>
+              </summary>
+              <dl className="qg-agent-plan-details">
+                {agentPlan.plan.details.map((item, index) => <div key={`${item.label}-${index}`}><dt>{item.label}</dt><dd>{item.value}</dd></div>)}
+              </dl>
+            </details>}
+            <div className="qg-agent-plan-footer">
+              <p className="qg-agent-plan-guidance"><MessageSquareText size={15} aria-hidden="true"/>
+                {agentPlan.status === "pending" ? "Want to change something? Just tell the agent in chat." : "Continue refining your questions here in Agent Mode."}
+              </p>
+              {agentPlan.status === "pending" ? <button className="qg-paper-primary qg-agent-plan-approve" type="button"
+                disabled={busy || agentPlanBusy || !!editingMessageId} onClick={() => void approvePlanAndDraft()}>
+                {agentPlanBusy ? <Loader2 size={15} className="qg-spin"/> : <Check size={15}/>}
+                Approve plan & draft questions
+              </button> : <button className="qg-paper-primary qg-agent-plan-approve" type="button"
+                disabled={busy || agentPlanBusy || !!editingMessageId}
+                onClick={() => void send("Continue drafting from our approved consultation plan without duplicating any existing questions.", {generate_from_plan: true})}>
+                {agentDrafts.length ? "Continue drafting" : "Generate questions"} <ArrowRight size={15}/>
+              </button>}
+            </div>
+          </section>}
+
+          {workspaceMode === "agent" && agentDrafts.length > 0 && <section
+            className={`qg-agent-draft-bank ${agentPlan?.status === "pending" ? "qg-agent-draft-bank--with-plan" : ""}`}
+            aria-label="Agent Mode question drafts">
+            <div className="qg-agent-bank-head">
+              <div className="qg-agent-bank-identity">
+                <span className="qg-agent-bank-icon" aria-hidden="true"><BookOpenText size={18}/></span>
+                <div className="qg-agent-bank-title">
+                  <span className="qg-agent-plan-kicker">QUESTION DRAFTS</span>
+                  <h2>Review your questions</h2>
+                </div>
+              </div>
+              <span className="qg-agent-bank-count" aria-live="polite">
+                <Check size={13} aria-hidden="true"/>
+                {agentDrafts.filter(item => item.selected).length} / {agentDrafts.length} selected
+              </span>
+            </div>
+            <div className="qg-agent-bank-toolbar">
+              <span>Select the questions you want in your paper.</span>
+              <button type="button" aria-pressed={showAgentAnswers} disabled={busy || agentDraftBusy}
+                onClick={() => setShowAgentAnswers(value => !value)}>
+                {showAgentAnswers ? <EyeOff size={14}/> : <Eye size={14}/>}
+                {showAgentAnswers ? "Hide answers" : "Show answers"}
+              </button>
+            </div>
+            <div className="qg-agent-question-list" aria-label="Question drafts to review">
+              {agentDrafts.map((draft, index) => {
+                const expanded = agentExpandedDraftId === draft.id;
+                const disabled = busy || agentDraftBusy;
+                return <article key={draft.id} className={`qg-agent-question ${expanded ? "qg-agent-question--expanded" : ""}`}>
+                  <div className="qg-agent-question-head">
+                    <label className="qg-agent-question-select" title={`Include question ${index + 1} in the exam`}>
+                      <input type="checkbox" checked={draft.selected} disabled={disabled}
+                        aria-label={`Select question ${index + 1}`} onChange={event => void updateAgentDraft(draft, {selected: event.target.checked})}/>
+                    </label>
+                    <button type="button" className="qg-agent-question-toggle"
+                      aria-expanded={expanded} aria-controls={expanded ? `agent-draft-detail-${draft.id}` : undefined}
+                      onClick={() => { setAgentExpandedDraftId(current => current === draft.id ? null : draft.id); setAgentDraftEditingId(null); }}>
+                      <span className="qg-agent-question-num">{String(index + 1).padStart(2, "0")}</span>
+                      <span className="qg-agent-question-preview">
+                        <strong>{draft.content.kind.replaceAll("_", " ")}</strong>
+                        <span>{draft.content.stem.replace(/\s+/g, " ").slice(0, 160)}</span>
+                      </span>
+                      <span className="qg-agent-question-marks">{draft.content.marks} {draft.content.marks === 1 ? "mark" : "marks"}</span>
+                      <ChevronDown size={15} className="qg-agent-question-chevron" aria-hidden="true"/>
+                    </button>
+                  </div>
+                  {expanded && <div id={`agent-draft-detail-${draft.id}`} className="qg-agent-question-expanded">
+                    <div className="qg-agent-question-meta">
+                      <span>{draft.content.topic}</span>
+                      {draft.content.difficulty && <span>{draft.content.difficulty.replaceAll("_", " ")}</span>}
+                    </div>
+                    {agentDraftEditingId === draft.id ? <QuestionFields initial={draft.content} busy={agentDraftBusy}
+                      onSave={async edits => { await updateAgentDraft(draft, {question: {...draft.content, ...edits}}); }}
+                      onCancel={() => setAgentDraftEditingId(null)}/>
+                    : <div className="qg-agent-question-body questgen-prose">
+                      <FormattedMessage content={draft.content.stem}/>
+                      {draft.content.options.length > 0 && <ol type="A">{draft.content.options.map((option, i) => <li key={i}>{option}</li>)}</ol>}
+                      {showAgentAnswers && <div className="qg-agent-answer"><strong>Suggested answer</strong><p>{draft.content.correct_answer}</p>
+                        {draft.content.explanation && <p>{draft.content.explanation}</p>}</div>}
+                    </div>}
+                    <div className="qg-agent-question-actions">
+                      <button type="button" disabled={disabled || agentDraftEditingId === draft.id}
+                        onClick={() => setAgentDraftEditingId(draft.id)}><Pencil size={14}/> Edit question</button>
+                      <button type="button" disabled={disabled} className="qg-agent-question-remove"
+                        onClick={() => void deleteAgentDraft(draft)} aria-label={`Remove draft question ${index + 1}`}>
+                        <Trash2 size={14}/> Remove
+                      </button>
+                    </div>
+                  </div>}
+                </article>;
+              })}
+            </div>
+            <div className="qg-agent-bank-footer">
+              <span className="qg-agent-bank-guidance">Review and select here. Format only when you're ready.</span>
+              <button type="button" className="qg-paper-primary qg-agent-bank-handoff" onClick={openHandoffConfirmation}
+                disabled={busy || agentDraftBusy || !agentDrafts.some(item => item.selected)}>
+                {agentDraftBusy ? <Loader2 className="qg-spin" size={15}/> : <ArrowRight size={15}/>}
+                Format selected in Exam Mode
+              </button>
+            </div>
+          </section>}
+          {workspaceMode === "exam" && agentHandoff && examPaper && <div className="qg-agent-import-context" role="status">
+            <CheckCircle2 size={16}/> {agentHandoff.question_ids.length} selected Agent Mode questions transferred without regeneration.
+            Conversation history is preserved; review the formatted paper and approve it before printing.
+          </div>}
           <div className="qg-compose-region">
             <div className="qg-compose-inner">
               {error && <div role="alert" className="qg-error"><AlertCircle size={17}/><span>{error}</span>{/error|cannot reach|request failed|backend/i.test(error) && <button type="button" className="qg-error-retry" onClick={() => void reconnectWorkspace()}><RefreshCw size={14}/> Retry loading</button>}<button type="button" aria-label="Dismiss error" onClick={() => setError("")}><X size={17}/></button></div>}
@@ -1673,7 +1990,7 @@ export default function ChatPage() {
                 {attachedDocuments.length > 0 && <div className="qg-attached-list" aria-label="Attached course materials">
                   {attachedDocuments.map((doc) => <span key={doc.id} className="qg-attached-chip"><Files size={13}/><span title={doc.filename}>{doc.filename}</span><button type="button" aria-label={`Remove ${doc.filename}`} onClick={() => setAttachedDocuments((old) => old.filter((item) => item.id !== doc.id))}><X size={13}/></button></span>)}
                 </div>}
-                <textarea ref={textRef} rows={1} maxLength={revisingSelection ? 1200 : 12000} value={composerText} onChange={(event) => revisingSelection ? setRevisionInput(event.target.value) : setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || examBusy || (revisingSelection && paperBusy) || !courseId || (workspaceMode !== "exam" && !settings.model)} aria-label={editingMessageId ? "Edit message in composer" : revisingSelection ? "Instructions for selected questions" : "Message QuestGen"} placeholder={revisingSelection ? "Describe what to change — e.g. make Q3 more analytical, use a different example… (optional)" : workspaceMode === "exam" ? "Answer the current question, or tell me your exam requirements…" : !settings.model ? "Choose a model in the top bar to begin…" : "Ask a question, learn, or discuss any topic…"}/>
+                <textarea ref={textRef} rows={1} maxLength={revisingSelection ? 1200 : 12000} value={composerText} onChange={(event) => revisingSelection ? setRevisionInput(event.target.value) : setInput(event.target.value)} onKeyDown={onKeyDown} disabled={busy || examBusy || (revisingSelection && paperBusy) || !courseId || (workspaceMode !== "exam" && !settings.model)} aria-label={editingMessageId ? "Edit message in composer" : revisingSelection ? "Instructions for selected questions" : "Message QuestGen"} placeholder={revisingSelection ? "Describe what to change — e.g. make Q3 more analytical, use a different example… (optional)" : workspaceMode === "exam" ? "Answer the current question, or tell me your exam requirements…" : !settings.model ? "Choose a model in the top bar to begin…" : workspaceMode === "agent" ? "Describe the questions to draft, revise, or investigate…" : "Ask a question, learn, or discuss any topic…"}/>
                 <div className="qg-composer-actions">
                   {editingMessageId ? (
                     <span className="qg-edit-help">Enter to save · Shift+Enter for new line · Esc to cancel</span>
@@ -1696,7 +2013,7 @@ export default function ChatPage() {
                 </div>
               </form>
               </>}
-              <div className="qg-compose-footer"><span>{workspaceMode === "exam" ? "EXAM · INTERACTIVE PAPER BUILDER" : "QUESTGEN · GENERAL CHAT"}</span><span>Review AI-generated content before use</span></div>
+              <div className="qg-compose-footer"><span>{workspaceMode === "exam" ? "EXAM · INTERACTIVE PAPER BUILDER" : workspaceMode === "agent" ? "QUESTGEN · AGENT MODE" : "QUESTGEN · GENERAL CHAT"}</span><span>Review AI-generated content before use</span></div>
             </div>
           </div>
           </div>
@@ -1705,7 +2022,12 @@ export default function ChatPage() {
             onEdit={(id, changes) => paperAction(`/questions/${id}`, "PATCH", changes)}
             onRemove={id => paperAction(`/questions/${id}`, "DELETE")}
             onReorder={question_ids => paperAction("/order", "PUT", {question_ids})}
-            onFinalApprove={() => paperAction("/final-approve")}
+            onFinalApprove={async () => {
+              let approved = false;
+              await paperAction("/final-approve", "POST", undefined, () => { approved = true; });
+              return approved;
+            }}
+            onLayout={async (title, instructions) => {await paperAction("/layout", "PUT", {title, instructions});}}
             onDownload={downloadPaper}
           />}
         </div>
@@ -1715,6 +2037,26 @@ export default function ChatPage() {
           onClose={() => { setDocumentsOpen(false); void refreshLibrary(courseId).catch(() => {}); }}/>}
       </main>
 
+      {handoffConfirmation && handoffConfirmation.threadId === threadId && <PaperActionDialog
+        eyebrow={handoffConfirmation.replace ? "EXAM MODE · REPLACE PAPER" : "AGENT MODE · PAPER HANDOFF"}
+        title={handoffConfirmation.replace ? "Replace your existing paper?" : "Ready to format your paper?"}
+        description={handoffConfirmation.replace
+          ? "This conversation already has an Exam Mode paper. Importing this selection will replace that paper and its current edits."
+          : "Your selected questions will move into Exam Mode for layout, final review and export. Cancel to keep editing them in Agent Mode."}
+        icon={handoffConfirmation.replace ? <AlertCircle size={19}/> : <ClipboardList size={19}/>}
+        details={[{label: "Selected questions", value: String(handoffConfirmation.questionIds.length)},
+          {label: "Question content", value: "Kept exactly as drafted"},
+          {label: "Conversation", value: "Retained in this thread"}]}
+        note={handoffConfirmation.replace
+          ? "The existing Exam Mode paper will be overwritten. Export still requires final approval."
+          : "No new questions will be generated. You'll approve the final layout in Exam Mode."}
+        confirmLabel={handoffConfirmation.replace ? "Replace & format" : "Format in Exam Mode"}
+        caution={handoffConfirmation.replace}
+        error={handoffProblem}
+        busy={agentDraftBusy}
+        onCancel={() => { setHandoffConfirmation(null); setHandoffProblem(""); }}
+        onConfirm={() => void formatSelectedInExam()}
+      />}
       {courseToDelete && (
         <div className="qg-modal-backdrop" onMouseDown={(event) => {
           if (event.target === event.currentTarget && !deletingCourse) { setCourseToDelete(null); setDeleteConfirmName(""); }
