@@ -5,8 +5,6 @@
 <h1 align="center">QuestGen</h1>
 <p align="center">An AI-powered, course-grounded assessment workspace for professors.</p>
 
-> **Status:** Active development.
-
 QuestGen combines course-material chat, academic research, question drafting, human review, and printable exam creation in one conversation.
 
 <p align="center">
